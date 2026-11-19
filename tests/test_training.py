@@ -24,7 +24,8 @@ class ScriptedModel:
     def __init__(self):
         self.actions = [action('verify_friend','K05',ASK)]
         self.body = ANSWER
-        self.disclosures = [Disclosure(focus='K05',quote='没亲自核实。')]
+        self.k05 = [{'kind':'self_denies_job_check','quote':'没亲自核实。'}]
+        self.disclosures = []
         self.supported = None
         self.safe = True
         self.break_at = None
@@ -41,7 +42,7 @@ class ScriptedModel:
     async def audit(self, role, history, text, facts, invite, actions, body):
         self.calls.append(('audit',role,history,dict(facts),invite))
         if self.break_at == 'audit': raise RuntimeError()
-        return Audit(safe=self.safe, supported=list(range(len(actions))) if self.supported is None else self.supported, disclosures=self.disclosures, registration_quote=self.reg)
+        return Audit(safe=self.safe, supported=list(range(len(actions))) if self.supported is None else self.supported, disclosures=self.disclosures, registration_quote=self.reg, k05=self.k05 if role == 'wang' else None)
 
 @pytest.fixture
 def lab(tmp_path, monkeypatch):
@@ -67,6 +68,7 @@ def test_full_evidence_chain_is_attributed_and_recoverable(lab):
     first = lab.snap()['messages']
     lab.model.actions = [action('identify_gap','K01',JUDGE),action('weigh_sources','K01',JUDGE)]
     lab.model.body, lab.model.disclosures = '明白，你想把这个说法单独核对。', []
+    lab.model.k05 = [{'kind':'other', 'quote':lab.model.body}]
     assert 'event: done' in lab.post(JUDGE).text
     snap = lab.snap()
     r = lab.end(kind='decision', choice='verify',reason='群里的消息并非独立证据。',cited=[first[1]['id']]).json()
@@ -84,13 +86,70 @@ def test_full_evidence_chain_is_attributed_and_recoverable(lab):
 
 @pytest.mark.parametrize('overclaims',[True,False])
 def test_source_only_is_not_k05(lab, overclaims):
-    lab.model.body = '我在群里看到过。'
+    question = '你从哪看到的？'
+    lab.model.actions = [action('verify_friend','K05',question)]
+    lab.model.body = '校园群里有人转发过。'
+    lab.model.k05 = [{'kind':'origin','quote':lab.model.body}]
     lab.model.disclosures = [Disclosure(focus='K05', quote=lab.model.body)] if overclaims else []
-    assert 'event: done' in lab.post().text
+    assert 'event: done' in lab.post(question).text
+    assert lab.snap()['messages'][1]['body'] == lab.model.body
     r = lab.end(kind='early').json()
     assert r['disclosures'] == []
     assert report_dims(r)['risk']['status'] == 'insufficient'
     assert report_dims(r)['verify']['evidence']
+
+@pytest.mark.parametrize('reply', ['没有，我只看了群转发，没跟招聘方打过交道。', '没有，群里看到的。', '没'])
+def test_k05_contextual_denial_links_only_to_wangs_reply(lab, reply):
+    question = '这机会你亲自问过招聘方吗？'
+    lab.model.actions = [action('verify_friend','K05',question)]
+    lab.model.body = reply
+    lab.model.k05 = [{'kind':'self_denies_job_check','quote':reply}]
+    assert 'event: done' in lab.post(question).text
+    report = lab.end(kind='early').json()
+    user, wang = lab.snap()['messages']
+    assert len(report['disclosures']) == 1
+    ref = report['disclosures'][0]
+    assert (ref['focus'], ref['role'], ref['speaker'], ref['message_id'], ref['quote']) == ('K05', 'wang', 'assistant', wang['id'], wang['body'])
+    assert report_dims(report)['verify']['evidence'][0]['message_id'] == user['id']
+    assert report_dims(report)['risk']['evidence'] == []
+
+@pytest.mark.parametrize(('reply','kind'), [
+    ('群里有人转发，我没问清楚源头。','origin'), ('我不知道转发的人有没有亲自核实。','uncertain'),
+    ('发给我的同学没亲自核实。','other_person'), ('那条消息我已经问过招聘方了。','other'),
+])
+def test_k05_does_not_transfer_uncertainty_or_another_speakers_denial(lab, reply, kind):
+    lab.model.body, lab.model.k05 = reply, [{'kind':kind, 'quote':reply}]
+    lab.model.disclosures = [Disclosure(focus='K05',quote=reply)]
+    assert 'event: done' in lab.post().text
+    assert lab.end(kind='early').json()['disclosures'] == []
+
+@pytest.mark.parametrize(('reply','quote'), [
+    ('群里转发的，但我跟招聘方没打过交道。','我跟招聘方没打过交道'),
+    ('我在校园群看到的，当时觉得挺有意思的，但没去查真伪。','但没去查真伪。'),
+])
+def test_source_question_cannot_hide_an_unsolicited_denial(lab, reply, quote):
+    question = '你从哪看到的？'
+    lab.model.actions = [action('verify_friend','K05',question)]
+    lab.model.body = reply
+    lab.model.k05 = [{'kind':'origin','quote':reply.split('，')[0]}, {'kind':'self_denies_job_check','quote':quote}]
+    assert 'event: done' in lab.post(question).text
+    disclosure, = lab.end(kind='early').json()['disclosures']
+    assert disclosure['quote'] == quote and disclosure['message_id'] == lab.snap()['messages'][1]['id']
+
+@pytest.mark.parametrize('failure', ['question_quote','missing_quote','blank_quote','partial_negative','missing_assessment','not_permitted','wrong_role'])
+def test_k05_invalid_attribution_never_commits_a_turn(lab, failure):
+    if failure == 'question_quote': lab.model.k05 = [{'kind':'self_denies_job_check','quote':ASK}]
+    if failure == 'missing_quote': lab.model.k05 = [{'kind':'self_denies_job_check'}]
+    if failure == 'blank_quote': lab.model.k05 = [{'kind':'self_denies_job_check','quote':' '}]
+    if failure == 'partial_negative': lab.model.k05 = [{'kind':'origin','quote':'我在校园群里看到转发'}]
+    if failure == 'wrong_role': lab.model.disclosures = [Disclosure(focus='K05',quote=ANSWER)]
+    if failure == 'missing_assessment': lab.model.k05 = None
+    if failure == 'not_permitted':
+        lab.model.actions, lab.model.disclosures = [], []
+    result = lab.post(role='lin' if failure == 'wrong_role' else 'wang')
+    assert 'event: error' in result.text and 'event: done' not in result.text
+    assert lab.snap()['messages'] == []
+    assert lab.end(kind='early').json()['disclosures'] == []
 
 def test_role_and_session_isolation(lab):
     lab.post()
@@ -140,6 +199,7 @@ def test_receipt_replay_after_refresh_and_finish(lab):
 def test_retelling_or_unmatched_quotes_do_not_generate_user_evidence(lab):
     lab.model.actions = [action('weigh_sources','K05','不能作证','retold'),action('identify_gap','K04','不在原文中'),action('verify_friend','K05','没问过','uncertain')]
     lab.model.body, lab.model.disclosures = '知道了。',[]
+    lab.model.k05 = [{'kind':'other','quote':lab.model.body}]
     assert 'event: done' in lab.post('对方说不能作证，没问过本人。').text
     r = lab.end(kind='decision',choice='leave').json()
     assert all(d['status'] == 'insufficient' for d in r['dimensions']) and r['total'] is None

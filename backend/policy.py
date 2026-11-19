@@ -23,11 +23,16 @@ class Disclosure(BaseModel):
     focus: Focus
     quote: str = Field(min_length=2, max_length=800)
 
+class K05Claim(BaseModel):
+    quote: str = Field(min_length=1, max_length=800)
+    kind: Literal['origin', 'other_person', 'uncertain', 'self_denies_job_check', 'other']
+
 class Audit(BaseModel):
     safe: bool
     supported: list[int] = Field(max_length=10)
     disclosures: list[Disclosure] = Field(max_length=5)
     registration_quote: str | None
+    k05: list[K05Claim] | None = Field(default=None, max_length=24)
 
 SCENE = '虚构场景：栖禾工作室的内容运营实习岗位出现在校园群的转发中。所有参与者与岗位均为虚构。'
 ROLES = {
@@ -38,7 +43,7 @@ ROLES = {
 FACTS = {
     'lin': {'K04': '自己负责的招聘应通过企业公开招聘渠道独立核对，不能据此确认这条转发或顾问与企业有合作。没有具体网址。'},
     'chen': {'K01': '是对接机会的顾问，但目前无法出示企业对这次招聘的书面授权。', 'K02': '预登记声称用于汇总求职意向，尚不能说明为何现阶段每项资料都必需。', 'K03': '目前没有明确可核对的保存期限或第三方处理说明。', 'K04': '眼下没有可独立核对这条转发的官方招聘编号或公告。'},
-    'wang': {'K05': '王宇本人没有亲自向招聘方核实过这条转发。仅说看过转发并不等于说出了这一事实。'},
+    'wang': {'K05': '王宇本人没有亲自向招聘方核实过这条转发。'},
 }
 FOCI = {'K01': '招聘主体与授权关系', 'K02': '资料用途与必要性', 'K03': '保存期限与第三方处理', 'K04': '可独立核对的官方依据', 'K05': '同学是否亲自核实'}
 RULES = {
@@ -92,7 +97,10 @@ def permission(role, actions, previous, refused):
     invite = role == 'chen' and not refused and any(a.kind == 'interest' for a in actions) and not any(a.kind == 'decline' for a in actions)
     return facts, invite
 
-def validate_reply(reply, audit, actions, facts, previous, invite):
+def k05_parts(body):
+    return [part.strip() for part in re.split(r'[，,。！？!?；;\n]+', body) if part.strip()]
+
+def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
     body = reply.body.strip()
     if not audit.safe:
         raise ValueError('unapproved reply')
@@ -105,11 +113,22 @@ def validate_reply(reply, audit, actions, facts, previous, invite):
         raise ValueError('unverified permission')
     disclosed = {}
     for d in audit.disclosures:
-        if d.focus not in facts or d.quote not in body:
+        if d.focus not in facts or d.quote not in body or (d.focus == 'K05' and role != 'wang'):
             raise ValueError('unattributed disclosure')
-        if d.focus == 'K05' and not re.search(r'(?:没(?:有)?|未(?:曾)?|不曾|还没)[^。！？；\n]{0,15}(?:核实|核对|确认|求证|验证|问过|查证|核验|联系)', d.quote):
-            continue
-        disclosed.setdefault(d.focus, d.quote)
+        if d.focus != 'K05':
+            disclosed.setdefault(d.focus, d.quote)
+    if (role == 'wang') != (audit.k05 is not None):
+        raise ValueError('missing or out-of-scope K05 assessment')
+    for claim in audit.k05 or []:
+        if not claim.quote.strip() or claim.quote not in body:
+            raise ValueError('unattributed K05 quote')
+        if claim.kind == 'self_denies_job_check':
+            if 'K05' not in facts:
+                raise ValueError('unapproved K05 disclosure')
+            disclosed.setdefault('K05', claim.quote)
+    if audit.k05 is not None and 'K05' not in disclosed:
+        if any(not any(part in c.quote for c in audit.k05) for part in k05_parts(body)):
+            raise ValueError('incomplete negative K05 assessment')
     reg = audit.registration_quote
     if reg is not None and (not reg.strip() or reg not in body or not invite or not any(a.kind == 'interest' for a in valid)):
         raise ValueError('unapproved registration')
