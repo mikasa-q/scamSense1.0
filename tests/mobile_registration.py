@@ -11,7 +11,7 @@ import uvicorn
 
 from backend.db import ROOT
 from backend.main import create_app
-from backend.model import INTERPRET
+from backend.model import INTERPRET, K05_INTERPRET
 from test_model_wire import COMBINED, CORRECTION, HELLO, INTEREST, REOPEN, SENT_THEN_REFUSED, wire_fixture
 
 
@@ -62,5 +62,6 @@ def test_mobile_registration(tmp_path, monkeypatch):
             finally:
                 server.should_exit = True
                 thread.join()
-    assert [d['current_user'] for step, d in calls if step == INTERPRET] == [
-        HELLO, INTEREST, COMBINED, CORRECTION, SENT_THEN_REFUSED, '我不参与预登记。', REOPEN]
+    assert [(step, d['current_user']) for step, d in calls if step in (K05_INTERPRET, INTERPRET)] == [
+        (K05_INTERPRET, HELLO), (INTERPRET, INTEREST), (INTERPRET, COMBINED), (INTERPRET, CORRECTION),
+        (INTERPRET, SENT_THEN_REFUSED), (INTERPRET, '我不参与预登记。'), (INTERPRET, REOPEN)]

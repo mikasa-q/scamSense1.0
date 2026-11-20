@@ -136,7 +136,7 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
         check_generated(reply.body)
         progress('正在核对本轮事实与原文')
         audit = await model.audit(role, history, text, facts, invite, actions, reply.body, registration)
-        body, valid, disclosed, reg = validate_reply(reply, audit, actions, facts, previous, registration)
+        body, valid, disclosed, reg = validate_reply(reply, audit, actions, facts, previous, registration, role=role)
         store_turn(factory, sid, rid, attempt, role, text, body, valid, disclosed, reg, registered)
         return True
     except Exception:

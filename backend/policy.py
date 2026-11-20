@@ -3,7 +3,7 @@ import re
 import unicodedata
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .registration import FIELDS, FieldKey, Status
 
@@ -32,11 +32,17 @@ class Disclosure(BaseModel):
     focus: Focus
     quote: str = Field(min_length=2, max_length=800)
 
+class K05Claim(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    part_id: int = Field(strict=True, ge=0)
+    kind: Literal['origin', 'other_person', 'uncertain', 'self_denies_job_check', 'other']
+
 class Audit(BaseModel):
     safe: bool
     supported: list[int] = Field(max_length=10)
     disclosures: list[Disclosure] = Field(max_length=5)
     registration_quote: str | None
+    k05: list[K05Claim] | None = Field(default=None, max_length=24)
 
 SCENE = '虚构校园求职场景：学生正在了解不同来源的初级 Python 后端开发实习机会。人物、企业和岗位均为虚构。'
 ROLES = json.loads(Path(__file__).with_name('role_cards.json').read_text(encoding='utf-8'))
@@ -146,7 +152,11 @@ def permission(role, actions, previous, registration):
     facts = {k:v for k,v in FACTS[role].items() if k in wanted}
     return facts, role == 'chen' and invitation_allowed(registration, actions)
 
-def validate_reply(reply, audit, actions, facts, previous, registration):
+def k05_parts(body):
+    marks = '，,。！？!?；;\n'
+    return re.findall(rf'[{marks}]*[^{marks}]+[{marks}]*', body.strip())
+
+def validate_reply(reply, audit, actions, facts, previous, registration, *, role):
     body = reply.body.strip()
     if not audit.safe:
         raise ValueError('unapproved reply')
@@ -159,15 +169,29 @@ def validate_reply(reply, audit, actions, facts, previous, registration):
     # A candidate rejected during audit cannot open a new fact gate.
     if (set(facts) - set(previous)) - allowed:
         raise ValueError('unverified permission')
+    parts = k05_parts(body) if role == 'wang' else []
     disclosed = {}
     for d in audit.disclosures:
         if d.focus not in facts or d.quote not in body:
             raise ValueError('unattributed disclosure')
-        if d.focus == 'K05' and not re.search(r'(?:没(?:有)?|未(?:曾)?|不曾|还没)[^。！？；\n]{0,15}(?:核实|核对|确认|求证|验证|问过|查证|核验|联系)', d.quote):
-            continue
-        disclosed.setdefault(d.focus, d.quote)
+        if d.focus != 'K05':
+            disclosed.setdefault(d.focus, d.quote)
+        elif role != 'wang' or (d.quote != body and d.quote not in parts):
+            raise ValueError('unexpected K05 excerpt')
+    if (role == 'wang') != (audit.k05 is not None):
+        raise ValueError('missing or out-of-scope K05 assessment')
+    if audit.k05 is not None:
+        ids = sorted(claim.part_id for claim in audit.k05)
+        if ids != list(range(len(parts))):
+            raise ValueError('invalid or incomplete K05 part IDs')
+        kinds = {claim.kind for claim in audit.k05}
+        if 'self_denies_job_check' in kinds:
+            if 'K05' not in facts or 'uncertain' in kinds:
+                raise ValueError('unapproved or contradictory K05 disclosure')
+            # A later clause can qualify an earlier one, so cite the intact Wang reply.
+            disclosed['K05'] = body
     reg = audit.registration_quote
-    invite = invitation_allowed(registration, valid)
+    invite = role == 'chen' and invitation_allowed(registration, valid)
     if invite and reg is None and not registration['invited']:
         raise ValueError('missing first invitation evidence')
     if reg is not None and (not reg.strip() or reg not in body or not invite):
