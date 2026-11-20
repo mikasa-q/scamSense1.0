@@ -3,8 +3,9 @@ import secrets
 import time
 from fastapi import HTTPException
 from sqlalchemy import select
-from .db import Ending, Message, Receipt, Review, StoryEvent, Trace, Training, uid, writer
-from .policy import ASKS, WHY, check_generated, permission, validate_actions, validate_reply
+from .db import Ending, Message, Receipt, RegistrationEntry, Review, StoryEvent, Trace, Training, uid, writer
+from .policy import ASKS, OPENINGS, WHY, check_generated, permission, validate_actions, validate_reply
+from .registration import registration_log, registration_state, was_invited
 from .review import RUBRIC, make_review, message_dict
 
 
@@ -34,8 +35,9 @@ def snapshot(factory, sid):
         s = db.get(Training, sid)
         messages = db.scalars(select(Message).where(Message.sid == sid).order_by(Message.id)).all()
         review = db.get(Review, sid)
-        registered = db.scalar(select(StoryEvent.id).where(StoryEvent.sid == sid, StoryEvent.kind == 'registration_proposed').limit(1)) is not None
-        return dict(id=s.id, created=s.created, stage=s.stage, closed=s.closed, busy=is_busy(s), registered=registered,
+        return dict(id=s.id, created=s.created, stage=s.stage, closed=s.closed, busy=is_busy(s),
+                    openings=OPENINGS, registered=was_invited(db, sid),
+                    registration=registration_state(registration_log(db, sid)),
                     messages=[message_dict(m) for m in messages], review=review.payload if review else None)
 
 def reserve(factory, sid, request_id, role, text, configured):
@@ -68,11 +70,13 @@ def private_context(factory, sid, role):
         msgs = db.scalars(select(Message).where(Message.sid == sid, Message.role == role).order_by(Message.id.desc()).limit(24)).all()
         history = [{'speaker':m.speaker, 'text':m.body} for m in reversed(msgs)]
         previous = set(db.scalars(select(Trace.focus).join(Message, Message.id == Trace.message_id).where(Trace.sid == sid, Trace.kind == 'disclosure', Message.role == role)))
-        registered = refused = False
+        registration = None
         if role == 'chen':
-            registered = db.scalar(select(StoryEvent.id).where(StoryEvent.sid == sid, StoryEvent.kind == 'registration_proposed').limit(1)) is not None
-            refused = db.scalar(select(Trace.id).where(Trace.sid == sid, Trace.kind == 'decline').limit(1)) is not None
-        return history, previous, registered, refused
+            registration = registration_state(registration_log(db, sid))
+            registration['invited'] = was_invited(db, sid)
+            registration['declined_all'] = db.scalar(select(Trace.id).where(
+                Trace.sid == sid, Trace.kind == 'decline').limit(1)) is not None
+        return history, previous, registration
 
 def record_event(db, s, kind, stage, mid=None):
     s.stage = max(s.stage, stage)
@@ -94,10 +98,15 @@ def store_turn(factory, sid, rid, attempt, role, text, body, actions, disclosed,
                 stage = {'verify_official':4, 'verify_friend':4, 'respond_registration':2, 'interest':1}.get(kind, s.stage)
                 record_event(db, s, kind, stage, user.id)
                 emitted.add(kind)
+            if a.kind == 'respond_registration':
+                db.add(RegistrationEntry(sid=sid, message_id=user.id, reply_id=reply.id,
+                                         field=a.field, status=a.status, quote=a.quote))
             if a.kind in WHY or a.kind == 'decline':
                 db.add(Trace(sid=sid, message_id=user.id, kind=a.kind, focus=a.focus, quote=a.quote, why=WHY.get(a.kind, '保留拒绝意愿，不再主动提出登记。')))
         if reg:
             record_event(db, s, 'registration_proposed', 2, reply.id)
+            db.add(Trace(sid=sid, message_id=reply.id, kind='registration_proposed',
+                         focus='none', quote=reg, why='陈浩实际发出了虚构预登记邀请。'))
         for focus, quote in disclosed.items():
             db.add(Trace(sid=sid, message_id=reply.id, kind='disclosure', focus=focus, quote=quote, why=WHY['disclosure']))
             s.stage = max(s.stage, 3)
@@ -114,16 +123,20 @@ def fail_turn(factory, sid, rid, attempt):
 async def run_turn(factory, model, sid, reservation, role, text, progress):
     rid, attempt = reservation
     try:
-        history, previous, registered, refused = private_context(factory, sid, role)
+        history, previous, registration = private_context(factory, sid, role)
+        registered = registration is not None and registration['invited']
         progress('正在理解你的发言')
-        analysis = await model.analyze(role, history, text)
+        analysis = await model.analyze(role, history, text, registration)
         actions = validate_actions(analysis, text, role, registered)
-        facts, invite = permission(role, actions, previous, refused)
+        facts, invite = permission(role, actions, previous, registration)
+        if registration is not None:
+            registration = {**registration, 'this_turn': [dict(field=a.field, status=a.status, quote=a.quote)
+                            for a in actions if a.kind == 'respond_registration']}
         progress('联系人正在组织回复')
-        reply = await model.reply(role, history, text, facts, invite)
+        reply = await model.reply(role, history, text, facts, invite, registration)
         check_generated(reply.body)
         progress('正在核对本轮事实与原文')
-        audit = await model.audit(role, history, text, facts, invite, actions, reply.body)
+        audit = await model.audit(role, history, text, facts, invite, actions, reply.body, registration)
         body, valid, disclosed, reg = validate_reply(reply, audit, actions, facts, previous, invite)
         store_turn(factory, sid, rid, attempt, role, text, body, valid, disclosed, reg, registered)
         return True

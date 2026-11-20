@@ -1,0 +1,27 @@
+<script setup lang="ts">
+import {statusText, submittedLabels, type FieldItem, type FieldStatus, type Registration} from '../data'
+
+defineProps<{registration:Registration; sid:string; locked:boolean; closed:boolean}>()
+const emit = defineEmits<{draft:[text:string]}>()
+function wording(item:FieldItem, status:FieldStatus) {
+  const field = item.label
+  return {agreed:`${field}可以给`, submitted:`我提交的${field}：${item.placeholder}`, deferred:`${field}先不提供`, refused:`我拒绝提供${field}`}[status]
+}
+</script>
+<template>
+  <section class="registration-panel" aria-label="候选人预登记">
+    <div class="dimension-title"><h3>候选人预登记</h3><span class="neutral-pill">仅限虚构资料</span></div>
+    <p class="muted">可以分别表态，也可以继续提问。同意不等于提交；只有发出对应的虚构占位值才算提交。</p>
+    <ul class="field-list">
+      <li v-for="item in registration.items" :key="item.key">
+        <div><b>{{item.label}}</b> <span class="stage-pill">{{item.status ? statusText[item.status] : '未表态'}}</span></div>
+        <a v-if="item.message_id" :href="`#/chat/${sid}/chen?m=${item.message_id}`">你的原话：「{{item.quote}}」</a>
+        <details v-if="!closed"><summary>拟写{{item.label}}的回应</summary>
+          <p>虚构占位值：{{item.placeholder}}。点选只写入草稿，不会发送。</p>
+          <div class="small-prompts"><button v-for="(label, status) in statusText" :key="status" type="button" :disabled="locked" @click="emit('draft',wording(item,status))">{{status==='submitted' ? '提交虚构占位值' : label}}</button></div>
+        </details>
+      </li>
+    </ul>
+    <p><b>已提交项：</b>{{submittedLabels(registration)}}</p>
+  </section>
+</template>

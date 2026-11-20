@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, Field
 
+from .registration import FIELDS, FieldKey, Status
+
 Role = Literal['lin', 'chen', 'wang']
 Focus = Literal['K01', 'K02', 'K03', 'K04', 'K05', 'none']
 ActionKind = Literal['interest', 'respond_registration', 'decline', 'ask_employer', 'ask_data', 'verify_official', 'verify_friend', 'identify_gap', 'weigh_sources']
@@ -14,6 +16,9 @@ class Action(BaseModel):
     focus: Focus
     quote: str = Field(min_length=2, max_length=600)
     source: Literal['own', 'retold', 'uncertain']
+    opportunity: Literal['lin', 'chen'] | None = None
+    field: FieldKey | None = None
+    status: Status | None = None
 
 class Analysis(BaseModel):
     actions: list[Action] = Field(max_length=10)
@@ -31,8 +36,13 @@ class Audit(BaseModel):
     disclosures: list[Disclosure] = Field(max_length=5)
     registration_quote: str | None
 
-SCENE = '虚构校园求职场景：一则初级 Python 后端开发实习机会在校园求职群里转发。人物、企业和岗位均为虚构。'
+SCENE = '虚构校园求职场景：学生正在了解不同来源的初级 Python 后端开发实习机会。人物、企业和岗位均为虚构。'
 ROLES = json.loads(Path(__file__).with_name('role_cards.json').read_text(encoding='utf-8'))
+OPENINGS = [
+    dict(role=role, title=card['public_facts']['岗位'], source=card['public_facts']['消息来源'],
+         description=card['public_facts']['工作内容'])
+    for role, card in ROLES.items() if role in ('lin', 'chen')
+]
 FACTS = {
     'lin': {'K04': '自己负责的面试通过招聘平台或公司官方邮箱沟通，可以通过公司公开招聘渠道独立核对。这不能证实群里的转发或顾问与公司的关系，没有具体网址或邮箱地址。'},
     'chen': {
@@ -79,20 +89,32 @@ def check_generated(body):
 def validate_actions(analysis, body, role, registered):
     result, seen = [], set()
     for a in analysis.actions:
-        if a.source != 'own' or a.quote not in body or a.focus not in RULES[a.kind] or (a.kind, a.focus) in seen:
+        if a.source != 'own' or not a.quote.strip() or a.quote not in body or a.focus not in RULES[a.kind]:
+            continue
+        if a.kind == 'interest' and a.opportunity != role:
             continue
         if a.kind == 'verify_friend' and role != 'wang':
             continue
-        if (a.kind in {'respond_registration','decline'} and role != 'chen') or (a.kind == 'respond_registration' and not registered):
+        if a.kind in {'respond_registration', 'decline'} and role != 'chen':
             continue
-        result.append(a)
-        seen.add((a.kind, a.focus))
+        if a.kind == 'respond_registration':
+            if not registered or not a.field or not a.status:
+                continue
+            if a.status == 'submitted' and FIELDS[a.field]['placeholder'] not in a.quote:
+                raise ValueError('submission requires the field’s fictional value in the user quote')
+        elif a.field or a.status:
+            continue
+        key = (a.kind, a.focus, a.field)
+        if key not in seen:
+            result.append(a)
+            seen.add(key)
     return result
 
-def permission(role, actions, previous, refused):
+def permission(role, actions, previous, registration):
     wanted = set(previous) | {a.focus for a in actions if a.kind in ASKS}
     facts = {k:v for k,v in FACTS[role].items() if k in wanted}
-    invite = role == 'chen' and not refused and any(a.kind == 'interest' for a in actions) and not any(a.kind == 'decline' for a in actions)
+    invite = (role == 'chen' and not registration['invited'] and not registration['declined_all']
+              and any(a.kind == 'interest' for a in actions) and not any(a.kind == 'decline' for a in actions))
     return facts, invite
 
 def validate_reply(reply, audit, actions, facts, previous, invite):
@@ -102,6 +124,8 @@ def validate_reply(reply, audit, actions, facts, previous, invite):
     if any(i < 0 or i >= len(actions) for i in audit.supported):
         raise ValueError('invalid evidence indexes')
     valid = [a for i,a in enumerate(actions) if i in audit.supported]
+    if any(a.kind == 'respond_registration' and i not in audit.supported for i, a in enumerate(actions)):
+        raise ValueError('reply based on an unverified field choice')
     allowed = {a.focus for a in valid if a.kind in ASKS}
     # A candidate rejected during audit cannot open a new fact gate.
     if (set(facts) - set(previous)) - allowed:
@@ -114,6 +138,8 @@ def validate_reply(reply, audit, actions, facts, previous, invite):
             continue
         disclosed.setdefault(d.focus, d.quote)
     reg = audit.registration_quote
+    if invite and any(a.kind == 'interest' for a in valid) and reg is None:
+        raise ValueError('missing invitation evidence')
     if reg is not None and (not reg.strip() or reg not in body or not invite or not any(a.kind == 'interest' for a in valid)):
         raise ValueError('unapproved registration')
     return body, valid, disclosed, reg

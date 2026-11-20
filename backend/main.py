@@ -26,7 +26,7 @@ class TurnInput(BaseModel):
 class EndInput(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     kind: Literal['early', 'decision']
-    choice: Literal['verify','leave','continue'] | None = None
+    choice: Literal['verify','leave','continue','necessary_only'] | None = None
     reason: str = Field(default='', max_length=600)
     cited: list[int] = Field(default_factory=list, max_length=6)
 

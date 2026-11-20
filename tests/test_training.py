@@ -16,8 +16,8 @@ ASK = '你亲自核实过这个岗位吗？'
 ANSWER = '我在校园群里看到转发，没亲自核实。'
 JUDGE = '群里转发不能证明招聘方获得了授权。'
 
-def action(kind, focus, quote, source='own'):
-    return Action(kind=kind, focus=focus, quote=quote, source=source)
+def action(kind, focus, quote, source='own', **attrs):
+    return Action(kind=kind, focus=focus, quote=quote, source=source, **attrs)
 
 class ScriptedModel:
     configured = True
@@ -30,15 +30,15 @@ class ScriptedModel:
         self.break_at = None
         self.reg = None
         self.calls = []
-    async def analyze(self, role, history, text):
+    async def analyze(self, role, history, text, registration):
         self.calls.append(('analysis',role,history,text))
         if self.break_at == 'analysis': raise RuntimeError()
         return Analysis(actions=self.actions)
-    async def reply(self, role, history, text, facts, invite):
+    async def reply(self, role, history, text, facts, invite, registration):
         self.calls.append(('reply',role,history,dict(facts),invite))
         if self.break_at == 'reply': raise RuntimeError()
         return Reply(body=self.body)
-    async def audit(self, role, history, text, facts, invite, actions, body):
+    async def audit(self, role, history, text, facts, invite, actions, body, registration):
         self.calls.append(('audit',role,history,dict(facts),invite))
         if self.break_at == 'audit': raise RuntimeError()
         return Audit(safe=self.safe, supported=list(range(len(actions))) if self.supported is None else self.supported, disclosures=self.disclosures, registration_quote=self.reg)
@@ -183,12 +183,79 @@ def test_concurrent_and_stale_attempts_cannot_commit(lab):
 
 def test_registration_is_an_actual_proposal_and_refusal_is_respected(lab):
     model = lab.model; interested = '我想了解这个岗位。'
-    model.actions,model.disclosures = [action('interest','none',interested)],[]
+    model.actions,model.disclosures = [action('interest','none',interested,opportunity='chen')],[]
     model.body,model.reg = '可以做虚构意向预登记，不需要实际资料。','可以做虚构意向预登记'
     lab.post(interested,'chen');assert lab.snap()['registered'] and lab.snap()['stage'] == 2
     no = '我不愿意登记。';model.actions = [action('decline','none',no)];model.reg=None;model.body='明白，我尊重你的决定。'
-    lab.post(no,'chen');model.actions=[action('interest','none',interested)]
+    lab.post(no,'chen');model.actions=[action('interest','none',interested,opportunity='chen')]
     lab.post(interested,'chen');assert model.calls[-2][-1] is False
+
+@pytest.mark.parametrize('role,target,source', [('chen','lin','own'),('lin','chen','own'),('chen','chen','retold'),('wang','chen','own')])
+def test_interest_must_be_own_and_directed_to_consultant(lab, role, target, source):
+    text = '同学对这份实习感兴趣。' if source == 'retold' else '我对林悦的岗位感兴趣。'
+    model = lab.model
+    model.actions = [action('interest','none',text,source,opportunity=target)]
+    model.disclosures, model.body = [], '可以继续核实岗位信息。'
+    assert 'event: done' in lab.post(text, role).text
+    assert not model.calls[-2][-1] and not lab.snap()['registered']
+    model.body = model.reg = '要参加预登记吗？'
+    assert 'event: error' in lab.post(text, role).text and not lab.snap()['registered']
+
+
+def propose(lab):
+    model = lab.model
+    interest = '我想应聘你介绍的这个岗位。'
+    model.actions = [action('interest','none',interest,opportunity='chen')]
+    model.disclosures, model.body = [], '可以自愿做虚构资料的预登记。'
+    model.reg = model.body
+    assert 'event: done' in lab.post(interest,'chen').text
+    model.reg = None
+    return model
+
+
+def test_partial_refusal_actual_submission_and_later_change_of_mind(lab):
+    model = propose(lab)
+    project, city = '我提交的项目经历：虚构项目 A', '我拒绝提供所在城市'
+    model.actions = [action('respond_registration','none',project,field='project_experience',status='submitted'),
+                     action('respond_registration','none',city,field='city',status='refused')]
+    model.body = '收到了虚构项目 A，城市不必提供。'
+    assert 'event: done' in lab.post(project+'，'+city,'chen').text
+    r = lab.snap()['registration']
+    assert [i['status'] for i in r['items']] == ['submitted','refused'] and r['submitted'] == ['project_experience']
+    last = '项目经历之后先不提供。'
+    model.actions = [action('respond_registration','none',last,field='project_experience',status='deferred')]
+    model.body = '可以，不需要继续给项目资料。'
+    assert 'event: done' in lab.post(last,'chen').text
+    r = lab.end(kind='decision',choice='necessary_only').json()['registration']
+    assert [i['status'] for i in r['items']] == ['deferred','refused'] and r['submitted'] == ['project_experience']
+    assert [(e['status'], e['quote']) for e in r['history']] == [('submitted',project),('refused',city),('deferred',last)]
+
+
+@pytest.mark.parametrize('failure',['intent_only','other_fields_value','unsupported','unsafe'])
+def test_unverified_item_changes_never_commit(lab, failure):
+    model = propose(lab)
+    text = {'intent_only':'我可以提供项目经历', 'other_fields_value':'项目经历：虚构城市 B'}.get(failure,'项目经历：虚构项目 A')
+    model.actions = [action('respond_registration','none',text,field='project_experience',status='submitted')]
+    model.body = '我收到了项目经历。'
+    if failure == 'unsupported': model.supported = []
+    if failure == 'unsafe': model.safe = False
+    before = lab.snap()
+    assert 'event: error' in lab.post(text,'chen').text
+    after = lab.snap()
+    assert after['registration'] == before['registration'] and after['messages'] == before['messages']
+
+
+def test_uninvited_and_other_contacts_cannot_change_registration(lab):
+    text = '项目经历可以给'
+    choice = action('respond_registration','none',text,field='project_experience',status='agreed')
+    lab.model.actions, lab.model.disclosures, lab.model.body = [choice], [], '我们可以先聊岗位。'
+    assert 'event: done' in lab.post(text,'chen').text
+    assert not lab.snap()['registered']
+    propose(lab)
+    lab.model.actions, lab.model.body = [choice], '我只介绍自己的岗位。'
+    assert 'event: done' in lab.post(text,'lin').text
+    assert all(i['status'] is None for i in lab.snap()['registration']['items'])
+
 
 def test_semantic_adapter_payload_is_role_scoped_and_not_resolved_on_client(lab, monkeypatch):
     import asyncio
