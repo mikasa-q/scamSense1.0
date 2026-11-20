@@ -1,4 +1,6 @@
+import asyncio
 import json
+import os
 import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,19 +11,24 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from backend.db import ROOT
 from backend.main import create_app
-from backend.model import INTERPRET, GENERATE, AUDIT
+from backend.model import AUDIT, GENERATE, INTERPRET, K05_ACTIONS, K05_AUDIT, K05_INTERPRET, CompatibleModel
+from backend.policy import Action, FACTS, Reply, k05_parts, validate_reply
 
-QUESTION = '你亲自核实过这个岗位吗？'
+QUESTION = '这机会你亲自问过招聘方吗？'
 JUDGMENT = '群里转发不能证明招聘方获得了授权。'
-REPLY = '我在校园群看到了这条消息，没亲自核实。'
+REPLY = '没有，群里看到的。'
+MEMORY_QUESTION = '你还记得当时有没有问过招聘方吗？'
+SOURCE_QUESTION = '你从哪看到的？'
 HELLO = '你好。'
 AUTH_QUESTION = '你能说明这次招聘的委托关系吗？'
 AUTH_REPLY = '我目前无法出示可核实的企业招聘授权。'
 TURNS = {
-    HELLO: ([], '你好，有什么想了解的？', []),
-    QUESTION: ([('verify_friend','K05')], REPLY, [{'focus':'K05','quote':'没亲自核实。'}]),
-    JUDGMENT: ([('identify_gap','K01'),('weigh_sources','K01')], '明白，你想先找依据。', []),
-    AUTH_QUESTION: ([('ask_employer','K01')], AUTH_REPLY, [{'focus':'K01','quote':AUTH_REPLY}]),
+    HELLO: ([], '你好，有什么想了解的？', [], ('other','other')),
+    QUESTION: ([('verify_friend','K05')], REPLY, [], ('self_denies_job_check','origin')),
+    MEMORY_QUESTION: ([('verify_friend','K05')], '我记不清当时问过没有。', [], ('uncertain',)),
+    SOURCE_QUESTION: ([('verify_friend','K05')], '我只在群里看过转发。', [], ('origin',)),
+    JUDGMENT: ([('identify_gap','K01'),('weigh_sources','K01')], '明白，你想先找依据。', [], ('other','other')),
+    AUTH_QUESTION: ([('ask_employer','K01')], AUTH_REPLY, [{'focus':'K01','quote':AUTH_REPLY}], ()),
 }
 
 @contextmanager
@@ -37,13 +44,15 @@ def wire_fixture():
             if self.path != '/v1/chat/completions' or msg not in TURNS or self.headers.get('Authorization'):
                 self.send_error(400); return
             calls.append((system,data))
-            pairs, reply, disclosures = TURNS[msg]
-            if system == INTERPRET:
+            pairs, reply, disclosures, kinds = TURNS[msg]
+            if system in (INTERPRET, K05_INTERPRET):
                 result = {'actions':[{'kind':k,'focus':f,'quote':msg,'source':'own'} for k,f in pairs]}
             elif system == GENERATE:
                 result = {'body':reply}
-            elif system == AUDIT:
+            elif system in (AUDIT, K05_AUDIT):
                 result = {'safe':True,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':None}
+                if system == K05_AUDIT:
+                    result['k05'] = [{'part_id':i, 'kind':kind} for i, kind in enumerate(kinds)]
             else:
                 self.send_error(400); return
             body = json.dumps({'choices':[{'message':{'role':'assistant','content':json.dumps(result,ensure_ascii=False)}}]},ensure_ascii=False).encode()
@@ -65,18 +74,55 @@ def wired_session(tmp_path, monkeypatch):
             s = client.post('/api/sessions').json(); path = '/api/sessions/'+s['id']; headers={'Authorization':'Bearer '+s['token']}
             yield client, path, headers, calls
 
+@pytest.mark.skipif(os.getenv('SCAMSENSE_TEST_LIVE_K05') != '1', reason='requires an explicitly enabled real model')
+@pytest.mark.parametrize(('question','reply','evidence'), [
+    (QUESTION, '没有，群里看到的。', ('没有',)),
+    (QUESTION, '没有，我只看了群转发，没跟招聘方打过交道。', ('没有', '没跟招聘方打过交道')),
+    ('我在整理校园招聘的信息渠道，你是在校园群、公众号还是学校网站看到这条消息的？',
+     '我在校园群看到的，当时觉得挺有意思的，但没去查真伪。', ('没去查真伪',)),
+    ('这条消息是你从学校官网看到的吗？', '没有，群里看到的。', ()),
+    ('你从哪看到的？', '校园群里有人转发过。', ()),
+    ('你从哪看到的？', '我是在群里看到的，没问清楚源头。', ()),
+    (QUESTION, '发给我的同学没亲自核实。', ()),
+    (QUESTION, '我记不清当时问过没有。', ()),
+], ids=['elliptical', 'natural', 'mixed', 'elliptical-origin', 'source', 'forward-origin', 'other-person', 'uncertain'])
+def test_live_k05_judgment(question, reply, evidence):
+    action = Action(kind='verify_friend', focus='K05', quote=question, source='own')
+    audit = asyncio.run(CompatibleModel().audit('wang', [], question, FACTS['wang'], False, [action], reply))
+    assert audit.supported == [0] and audit.k05 is not None
+    _, _, disclosed, _ = validate_reply(Reply(body=reply), audit, [action], FACTS['wang'], set(), False, role='wang')
+    assert disclosed == ({'K05':reply} if evidence else {})
+    parts = k05_parts(reply)
+    denied = [parts[claim.part_id] for claim in audit.k05 if claim.kind == 'self_denies_job_check']
+    assert all(any(fragment in part for fragment in evidence) for part in denied)
 
-def test_two_turns_through_compatible_http_contract(wired_session):
+
+@pytest.mark.parametrize(('question','expected_parts','expect_k05'), [
+    (QUESTION, ['没有，','群里看到的。'], True),
+    (MEMORY_QUESTION, ['我记不清当时问过没有。'], False),
+    (SOURCE_QUESTION, ['我只在群里看过转发。'], False),
+], ids=['denial','uncertain','forward-only'])
+def test_two_turns_through_compatible_http_contract(wired_session, question, expected_parts, expect_k05):
     client, path, headers, calls = wired_session
-    for msg in [QUESTION,JUDGMENT]:
+    for msg in [question,JUDGMENT]:
         res = client.post(path+'/turns',headers=headers,json={'role':'wang','text':msg,'request_id':str(uuid4())})
         assert 'event: done' in res.text and res.text.count('event: progress') == 3
     report = client.post(path+'/finish',headers=headers,json={'kind':'decision','choice':'verify','reason':JUDGMENT,'cited':[1,2]}).json()
-    assert len(calls) == 6
-    assert [role for role,_ in calls] == [INTERPRET,GENERATE,AUDIT]*2
-    assert set(calls[1][1]['permitted_facts']) == {'K05'}
-    assert [e['focus'] for e in report['disclosures']] == ['K05']
-    assert report['dimensions'][0]['evidence'][0]['quote'] == JUDGMENT
+    assert [prompt for prompt,_ in calls] == [K05_INTERPRET,GENERATE,K05_AUDIT]*2
+    reply = ''.join(expected_parts)
+    audit = calls[2][1]
+    assert calls[1][1]['permitted_facts'] == audit['permitted_facts'] == {'K05':FACTS['wang']['K05']}
+    assert audit['current_user'] == question and audit['reply'] == reply
+    assert audit['reply_parts'] == [{'part_id':i, 'text':part} for i, part in enumerate(expected_parts)]
+    for _, payload in calls[3:]:
+        assert payload['private_history'] == [{'speaker':'user','text':question}, {'speaker':'assistant','text':reply}]
+    if expect_k05:
+        ref, = report['disclosures']
+        assert (ref['focus'],ref['role'],ref['speaker'],ref['message_id'],ref['quote']) == ('K05','wang','assistant',2,reply)
+    else:
+        assert report['disclosures'] == []
+    risk, = report['dimensions'][0]['evidence']
+    assert (risk['speaker'],risk['message_id'],risk['quote']) == ('user',3,JUDGMENT)
 
 
 def test_model_receives_only_the_active_role_card(wired_session):
@@ -90,7 +136,13 @@ def test_model_receives_only_the_active_role_card(wired_session):
         res = client.post(path+'/turns',headers=headers,json={'role':role,'text':HELLO,'request_id':str(uuid4())})
         assert 'event: done' in res.text
         analysis, generation, audit = (payload for _,payload in calls[-3:])
-        assert analysis == {'contact':name, 'private_history':[], 'current_user':HELLO}
+        expected_analysis = {'contact':name, 'private_history':[], 'current_user':HELLO}
+        if role == 'wang':
+            expected_analysis['source_action_guide'] = K05_ACTIONS
+        prompts = [K05_INTERPRET,GENERATE,K05_AUDIT] if role == 'wang' else [INTERPRET,GENERATE,AUDIT]
+        assert [prompt for prompt,_ in calls[-3:]] == prompts
+        assert analysis == expected_analysis
+        assert ('reply_parts' in audit) == (role == 'wang')
         assert generation['character']['name'] == name and 'Python 后端' in generation['scene']
         assert generation['private_history'] == [] and generation['permitted_facts'] == {}
         assert generation['allow_invitation'] is False
@@ -102,11 +154,14 @@ def test_model_receives_only_the_active_role_card(wired_session):
 
 def test_employer_question_unlocks_only_the_consultants_authorization_clue(wired_session):
     client, path, headers, calls = wired_session
-    for role, msg in [('chen',AUTH_QUESTION), ('lin',HELLO)]:
+    for role, msg in [('chen',AUTH_QUESTION), ('lin',HELLO), ('wang',HELLO)]:
         res = client.post(path+'/turns',headers=headers,json={'role':role,'text':msg,'request_id':str(uuid4())})
         assert 'event: done' in res.text
     for _,payload in calls[1:3]:
         assert set(payload['permitted_facts']) == {'K01'}
         assert '委托关系' in payload['permitted_facts']['K01'] and not payload['allow_invitation']
-    for _,payload in calls[4:6]:
-        assert payload['permitted_facts'] == {} and payload['private_history'] == []
+    for prompt,payload in calls[3:]:
+        assert payload['private_history'] == []
+        assert AUTH_REPLY not in json.dumps(payload, ensure_ascii=False)
+        if prompt in (GENERATE, AUDIT, K05_AUDIT):
+            assert payload['permitted_facts'] == {}
