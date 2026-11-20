@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from .db import Ending, Message, Receipt, RegistrationEntry, Review, StoryEvent, Trace, Training, uid, writer
 from .policy import ASKS, OPENINGS, WHY, check_generated, permission, validate_actions, validate_reply
-from .registration import registration_log, registration_state, was_invited
+from .registration import declined_all, registration_log, registration_state, was_invited
 from .review import RUBRIC, make_review, message_dict
 
 
@@ -37,7 +37,7 @@ def snapshot(factory, sid):
         review = db.get(Review, sid)
         return dict(id=s.id, created=s.created, stage=s.stage, closed=s.closed, busy=is_busy(s),
                     openings=OPENINGS, registered=was_invited(db, sid),
-                    registration=registration_state(registration_log(db, sid)),
+                    registration={**registration_state(registration_log(db, sid)), 'declined_all': declined_all(db, sid)},
                     messages=[message_dict(m) for m in messages], review=review.payload if review else None)
 
 def reserve(factory, sid, request_id, role, text, configured):
@@ -74,8 +74,7 @@ def private_context(factory, sid, role):
         if role == 'chen':
             registration = registration_state(registration_log(db, sid))
             registration['invited'] = was_invited(db, sid)
-            registration['declined_all'] = db.scalar(select(Trace.id).where(
-                Trace.sid == sid, Trace.kind == 'decline').limit(1)) is not None
+            registration['declined_all'] = declined_all(db, sid)
         return history, previous, registration
 
 def record_event(db, s, kind, stage, mid=None):
@@ -93,16 +92,16 @@ def store_turn(factory, sid, rid, attempt, role, text, body, actions, disclosed,
         db.flush()
         emitted = set()
         for a in actions:
-            kind = 'respond_registration' if a.kind == 'decline' else a.kind
+            kind = 'respond_registration' if a.kind in {'decline', 'resume_registration'} else a.kind
             if kind not in emitted and (kind in ASKS or kind == 'interest' or (kind == 'respond_registration' and registered)):
                 stage = {'verify_official':4, 'verify_friend':4, 'respond_registration':2, 'interest':1}.get(kind, s.stage)
                 record_event(db, s, kind, stage, user.id)
                 emitted.add(kind)
             if a.kind == 'respond_registration':
                 db.add(RegistrationEntry(sid=sid, message_id=user.id, reply_id=reply.id,
-                                         field=a.field, status=a.status, quote=a.quote))
-            if a.kind in WHY or a.kind == 'decline':
-                db.add(Trace(sid=sid, message_id=user.id, kind=a.kind, focus=a.focus, quote=a.quote, why=WHY.get(a.kind, '保留拒绝意愿，不再主动提出登记。')))
+                                         field=a.field, status=a.status, quote=a.quote, position=a.position))
+            if a.kind in WHY:
+                db.add(Trace(sid=sid, message_id=user.id, kind=a.kind, focus=a.focus, quote=a.quote, why=WHY[a.kind]))
         if reg:
             record_event(db, s, 'registration_proposed', 2, reply.id)
             db.add(Trace(sid=sid, message_id=reply.id, kind='registration_proposed',
@@ -137,7 +136,7 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
         check_generated(reply.body)
         progress('正在核对本轮事实与原文')
         audit = await model.audit(role, history, text, facts, invite, actions, reply.body, registration)
-        body, valid, disclosed, reg = validate_reply(reply, audit, actions, facts, previous, invite)
+        body, valid, disclosed, reg = validate_reply(reply, audit, actions, facts, previous, registration)
         store_turn(factory, sid, rid, attempt, role, text, body, valid, disclosed, reg, registered)
         return True
     except Exception:

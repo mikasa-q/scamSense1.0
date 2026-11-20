@@ -231,6 +231,69 @@ def test_partial_refusal_actual_submission_and_later_change_of_mind(lab):
     assert [(e['status'], e['quote']) for e in r['history']] == [('submitted',project),('refused',city),('deferred',last)]
 
 
+@pytest.mark.parametrize('first,first_status,last,last_status,submitted', [
+    ('所在城市可以给', 'agreed', '所在城市先不提供', 'deferred', []),
+    ('我提交的所在城市：虚构城市 B', 'submitted', '我拒绝继续提供所在城市', 'refused', ['city']),
+])
+def test_same_turn_corrections_follow_the_source_not_candidate_order(lab, first, first_status, last, last_status, submitted):
+    model = propose(lab)
+    earlier = action('respond_registration', 'none', first, field='city', status=first_status)
+    later = action('respond_registration', 'none', last, field='city', status=last_status)
+    model.actions, model.body = [later, earlier, earlier], '明白，按你最后说的办。'
+    text, rid = first + '。算了，' + last, str(uuid4())
+    assert 'event: done' in lab.post(text, 'chen', rid).text
+    assert '"cached":true' in lab.post(text, 'chen', rid).text
+    snap = lab.snap()
+    city = next(i for i in snap['registration']['items'] if i['key'] == 'city')
+    assert (city['status'], city['quote']) == (last_status, last)
+    r = lab.end(kind='early').json()['registration']
+    assert r['items'] == snap['registration']['items'] and r['submitted'] == submitted
+    assert [(e['status'], e['quote']) for e in r['history']] == [(first_status, first), (last_status, last)]
+    assert all((e['message_id'], e['reply_id']) == tuple(m['id'] for m in snap['messages'][-2:]) for e in r['history'])
+
+
+def test_repeated_quote_needs_a_verified_position(lab):
+    model = propose(lab)
+    yes, no = '所在城市可以给', '所在城市先不提供'
+    text = f'{yes}。{no}。{yes}'
+    def city(quote, status, **attrs):
+        return action('respond_registration', 'none', quote, field='city', status=status, **attrs)
+    model.body = '明白，最后是愿意给，但还没有提交。'
+    for ambiguous in [city(yes, 'agreed'), city(yes, 'agreed', position=1)]:
+        model.actions = [ambiguous]
+        before = lab.snap()
+        assert 'event: error' in lab.post(text, 'chen').text and lab.snap() == before
+    model.actions = [city(yes, 'agreed', position=text.rindex(yes)), city(no, 'deferred'), city(yes, 'agreed', position=0)]
+    assert 'event: done' in lab.post(text, 'chen').text
+    r = lab.end(kind='early').json()['registration']
+    assert [e['quote'] for e in r['history']] == [yes, no, yes]
+    assert r['submitted'] == [] and r['items'][1]['status'] == 'agreed'
+
+
+@pytest.mark.parametrize('previous_invitation', [False, True])
+def test_only_explicit_audited_reopening_overrides_whole_decline(lab, previous_invitation):
+    model = propose(lab) if previous_invitation else lab.model
+    stop, interest, resume = '我拒绝整个登记。', '我对你的岗位仍然感兴趣。', '我改主意了，现在想登记'
+    model.actions, model.disclosures, model.body = [action('decline', 'none', stop)], [], '好的，不再邀请你登记。'
+    assert 'event: done' in lab.post(stop, 'chen').text
+    model.actions = [action('interest', 'none', interest, opportunity='chen')]
+    model.body = '可以继续了解这个岗位。'
+    assert 'event: done' in lab.post(interest, 'chen').text and not model.calls[-2][-1]
+    model.actions = [action('resume_registration', 'none', resume)]
+    model.body = '好的，已恢复。' if previous_invitation else '那可以进行虚构预登记。'
+    model.reg = None if previous_invitation else model.body
+    before = lab.snap()
+    model.supported = []
+    assert 'event: error' in lab.post(resume, 'chen').text and lab.snap() == before
+    model.supported = None
+    assert 'event: done' in lab.post(resume, 'chen').text and model.calls[-2][-1]
+    assert not training.private_context(lab.app.state.factory, lab.sid, 'chen')[2]['declined_all']
+    model.actions, model.reg, model.body = [action('interest', 'none', interest, opportunity='chen')], None, '我们继续聊岗位。'
+    assert 'event: done' in lab.post(interest, 'chen').text and not model.calls[-2][-1]
+    r = lab.end(kind='early').json()['registration']
+    assert r['submitted'] == [] and [e['quote'] for e in r['references'] if e['speaker'] == 'user'] == [stop, resume]
+
+
 @pytest.mark.parametrize('failure',['intent_only','other_fields_value','unsupported','unsafe'])
 def test_unverified_item_changes_never_commit(lab, failure):
     model = propose(lab)

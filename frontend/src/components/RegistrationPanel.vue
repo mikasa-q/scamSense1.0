@@ -11,12 +11,13 @@ function wording(item:FieldItem, status:FieldStatus) {
 <template>
   <section class="registration-panel" aria-label="候选人预登记">
     <div class="dimension-title"><h3>候选人预登记</h3><span class="neutral-pill">仅限虚构资料</span></div>
-    <p class="muted">可以分别表态，也可以继续提问。同意不等于提交；只有发出对应的虚构占位值才算提交。</p>
+    <p v-if="registration.declined_all" class="muted">你已停止整个登记。之前的记录仍保留，可以继续问岗位问题。</p>
+    <p v-else class="muted">可以分别表态，也可以继续提问。同意不等于提交；只有发出对应的虚构占位值才算提交。</p>
     <ul class="field-list">
       <li v-for="item in registration.items" :key="item.key">
         <div><b>{{item.label}}</b> <span class="stage-pill">{{item.status ? statusText[item.status] : '未表态'}}</span></div>
         <a v-if="item.message_id" :href="`#/chat/${sid}/chen?m=${item.message_id}`">你的原话：「{{item.quote}}」</a>
-        <details v-if="!closed"><summary>拟写{{item.label}}的回应</summary>
+        <details v-if="!closed && !registration.declined_all"><summary>拟写{{item.label}}的回应</summary>
           <p>虚构占位值：{{item.placeholder}}。点选只写入草稿，不会发送。</p>
           <div class="small-prompts"><button v-for="(label, status) in statusText" :key="status" type="button" :disabled="locked" @click="emit('draft',wording(item,status))">{{status==='submitted' ? '提交虚构占位值' : label}}</button></div>
         </details>

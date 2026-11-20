@@ -14,7 +14,7 @@ export type FieldKey = 'project_experience'|'city'
 export const statusText = {agreed:'同意提供', submitted:'已提交', deferred:'暂缓', refused:'拒绝'} as const
 export type FieldStatus = keyof typeof statusText
 export interface FieldItem {key:FieldKey; label:string; placeholder:string; status:FieldStatus|null; quote:string|null; message_id:number|null}
-export interface Registration {items:FieldItem[]; submitted:FieldKey[]}
+export interface Registration {items:FieldItem[]; submitted:FieldKey[]; declined_all?:boolean}
 export interface FieldEntry {field:FieldKey; status:FieldStatus; quote:string; message_id:number; reply_id:number; reply_quote:string}
 export const submittedLabels = (r:Registration) => r.items.filter(i=>r.submitted.includes(i.key)).map(i=>i.label).join('、') || '无'
 export type Choice = 'verify'|'leave'|'continue'|'necessary_only'

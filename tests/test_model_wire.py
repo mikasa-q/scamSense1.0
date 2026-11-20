@@ -14,7 +14,7 @@ from backend.model import INTERPRET, GENERATE, AUDIT
 QUESTION = '你亲自核实过这个岗位吗？'
 JUDGMENT = '群里转发不能证明招聘方获得了授权。'
 REPLY = '我在校园群看到了这条消息，没亲自核实。'
-HELLO = '你好。'
+HELLO = '你好'
 AUTH_QUESTION = '你能说明这次招聘的委托关系吗？'
 AUTH_REPLY = '我目前无法出示可核实的企业招聘授权。'
 INTEREST = '我对你介绍的 Python 实习感兴趣。'
@@ -23,6 +23,12 @@ MIXED = '项目经历可以给，所在城市先不提供'
 ACK = '明白，你愿意给项目经历，城市先不提供。现在两项资料我都还没有收到。'
 PURPOSE = '登记资料用来做什么？'
 PURPOSE_REPLY = '说是为了汇总意向、安排面试，但我说不清为什么初筛就需要简历以外的资料。'
+COMBINED = MIXED + '\n我还想问：' + PURPOSE
+CITY_AGREED, CITY_DEFERRED = '所在城市可以给', '所在城市先不提供'
+CORRECTION = CITY_AGREED + '。算了，' + CITY_DEFERRED
+PROJECT_SENT, PROJECT_REFUSED = '我提交的项目经历：虚构项目 A', '我拒绝继续提供项目经历'
+SENT_THEN_REFUSED = PROJECT_SENT + '。' + PROJECT_REFUSED
+REOPEN = '我改主意了，现在想登记'
 
 
 def candidate(kind, focus, quote, **attrs):
@@ -38,7 +44,15 @@ TURNS = {
     MIXED: ([candidate('respond_registration','none','项目经历可以给',field='project_experience',status='agreed'),
              candidate('respond_registration','none','所在城市先不提供',field='city',status='deferred')], ACK, []),
     PURPOSE: ([candidate('ask_data','K02',PURPOSE)], PURPOSE_REPLY, [{'focus':'K02','quote':PURPOSE_REPLY}]),
+    CORRECTION: ([candidate('respond_registration','none',CITY_DEFERRED,field='city',status='deferred'),
+                  candidate('respond_registration','none',CITY_AGREED,field='city',status='agreed')], '好的，城市资料暂缓。', []),
+    SENT_THEN_REFUSED: ([candidate('respond_registration','none',PROJECT_REFUSED,field='project_experience',status='refused'),
+                         candidate('respond_registration','none',PROJECT_SENT,field='project_experience',status='submitted')],
+                        '已收到虚构项目 A，不需要再提供项目经历。', []),
+    '我不参与预登记。': ([candidate('decline','none','我不参与预登记。')], '明白，不再邀请你登记。', []),
+    REOPEN: ([candidate('resume_registration','none',REOPEN)], INVITE, []),
 }
+TURNS[COMBINED] = (TURNS[MIXED][0] + TURNS[PURPOSE][0], ACK + PURPOSE_REPLY, TURNS[PURPOSE][2])
 
 @contextmanager
 def wire_fixture():
@@ -59,7 +73,7 @@ def wire_fixture():
             elif system == GENERATE:
                 result = {'body':reply}
             elif system == AUDIT:
-                result = {'safe':True,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':INVITE if msg == INTEREST else None}
+                result = {'safe':True,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':INVITE if msg in (INTEREST, REOPEN) else None}
             else:
                 self.send_error(400); return
             body = json.dumps({'choices':[{'message':{'role':'assistant','content':json.dumps(result,ensure_ascii=False)}}]},ensure_ascii=False).encode()
@@ -93,6 +107,24 @@ def test_two_turns_through_compatible_http_contract(wired_session):
     assert set(calls[1][1]['permitted_facts']) == {'K05'}
     assert [e['focus'] for e in report['disclosures']] == ['K05']
     assert report['dimensions'][0]['evidence'][0]['quote'] == JUDGMENT
+
+
+@pytest.mark.parametrize('cite_disclosure', [False, True])
+def test_decision_keeps_citations_separate_from_corroborating_evidence(wired_session, cite_disclosure):
+    client, path, headers, _ = wired_session
+    for msg in [HELLO, QUESTION]:
+        res = client.post(path+'/turns', headers=headers, json={'role':'wang','text':msg,'request_id':str(uuid4())})
+        assert 'event: done' in res.text
+    messages = client.get(path, headers=headers).json()['messages']
+    cited = [messages[0]] + ([messages[-1]] if cite_disclosure else [])
+    r = client.post(path+'/finish', headers=headers, json={'kind':'decision','choice':'necessary_only',
+                    'reason':'','cited':[m['id'] for m in cited]}).json()
+    decision = next(d for d in r['dimensions'] if d['key'] == 'decision')
+    assert r['ending']['cited'] == [m['id'] for m in cited]
+    assert [(e['message_id'],e['quote']) for e in decision['evidence']] == [(m['id'],m['body']) for m in cited]
+    assert decision['status'] == ('pending' if cite_disclosure else 'insufficient')
+    assert decision['score'] is None and r['total'] is None
+    assert client.get(path, headers=headers).json()['review'] == r
 
 
 def test_model_receives_only_the_active_role_card(wired_session):

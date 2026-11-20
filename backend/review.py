@@ -1,9 +1,9 @@
 from sqlalchemy import select
 from .db import Message, Trace
 from .policy import ASKS, FOCI
-from .registration import registration_log, registration_state
+from .registration import declined_all, registration_log, registration_state
 
-RUBRIC = 'evidence-only-v1'
+RUBRIC = 'evidence-only-v2'
 CHOICES = {'verify':'先核实再决定', 'leave':'退出招聘流程', 'continue':'继续了解机会', 'necessary_only':'仅提交必要资料'}
 FOLLOW_UPS = {
     'K01': '谁是招聘主体？顾问的委托关系能否向企业独立核对？',
@@ -24,9 +24,11 @@ def make_review(db, sid, ending):
     rows = db.execute(select(Trace, Message).join(Message, Trace.message_id == Message.id).where(Trace.sid == sid).order_by(Trace.id)).all()
     groups = {key: [] for key, _, _ in DIMS}
     disclosures, registration_refs = [], []
+    log = registration_log(db, sid)
+    grounded_ids = {e['message_id'] for e in log}
     for t, m in rows:
         ref = dict(role=m.role, speaker=m.speaker, message_id=m.id, focus=t.focus, topic=FOCI.get(t.focus, ''), quote=t.quote, why=t.why)
-        if t.kind in {'registration_proposed', 'decline'}:
+        if t.kind in {'registration_proposed', 'decline', 'resume_registration'}:
             registration_refs.append(ref)
         elif t.kind == 'disclosure':
             disclosures.append(ref)
@@ -36,11 +38,18 @@ def make_review(db, sid, ending):
             groups['risk'].append(ref)
         elif t.kind == 'weigh_sources':
             groups['sources'].append(ref)
+        else:
+            continue
+        grounded_ids.add(m.id)
     if ending.kind == 'decision' and ending.cited:
         for m in db.scalars(select(Message).where(Message.sid == sid, Message.id.in_(ending.cited)).order_by(Message.id)):
             groups['decision'].append(dict(role=m.role, speaker=m.speaker, message_id=m.id, focus='decision', topic='决策引用', quote=m.body, why='你在提交决定时引用了这条消息。引用不等同于判断正确。'))
-    dimensions = [dict(key=k, label=label, weight=w, score=None, status='pending' if groups[k] else 'insufficient', evidence=groups[k]) for k,label,w in DIMS]
-    log = registration_log(db, sid)
+    dimensions = []
+    for key, label, weight in DIMS:
+        evidence = groups[key]
+        has_basis = bool(grounded_ids.intersection(ending.cited)) if key == 'decision' else bool(evidence)
+        dimensions.append(dict(key=key, label=label, weight=weight, score=None,
+                               status='pending' if has_basis else 'insufficient', evidence=evidence))
     asked = {e['focus'] for e in groups['verify']}
     heard = {e['focus'] for e in disclosures}
     follow_ups = [dict(focus=k, topic=FOCI[k], question=q,
@@ -48,4 +57,5 @@ def make_review(db, sid, ending):
                               '提问有记录，尚无可引用的披露' if k in asked else '本场尚无核实问答依据'))
                   for k, q in FOLLOW_UPS.items()]
     return dict(rubric=RUBRIC, total=None, dimensions=dimensions, disclosures=disclosures, ending=ending_dict(ending),
-                registration={**registration_state(log), 'history': log, 'references': registration_refs}, follow_ups=follow_ups)
+                registration={**registration_state(log), 'declined_all': declined_all(db, sid),
+                              'history': log, 'references': registration_refs}, follow_ups=follow_ups)

@@ -18,10 +18,11 @@ const turns=computed(()=>{
 <template><div class="page-intro"><div class="eyebrow"><span></span> FIELD NOTES &nbsp;/&nbsp; CASE 001</div><h1>本场训练复盘</h1><p>{{scene}} · 从原话出发，区分角色透露的信息和你自己的判断。</p></div><div class="report-summary"><div class="eyebrow">SESSION OUTCOME</div><h2>{{report.ending.label}}</h2><p>{{report.ending.kind==='early'?'你结束了模拟，没有作正式招聘决定。':report.ending.reason ? `你的判断理由：「${report.ending.reason}」` : '你提交了正式选择，没有填写判断理由。'}}</p><small>综合分：{{report.total??'—'}} &nbsp; / &nbsp; 量表未定稿，不按缺失项重算总分。</small></div>
   <section v-if="report.registration" class="desk-section" aria-label="登记复盘"><header class="section-head"><h2>你实际提交了什么</h2></header>
     <div class="panel clues"><h3>已提交项：{{submittedLabels(report.registration)}}</h3><p class="muted">这里只统计实际发给陈浩的虚构占位资料。表达同意和选择终局都不算提交。</p>
+      <p v-if="report.registration.declined_all">你最后选择了停止整个登记，之前发出的资料仍计入提交历史。</p>
       <ul class="field-list"><li v-for="i in report.registration.items" :key="i.key"><b>{{i.label}}</b> · {{i.status ? statusText[i.status] : '未表态'}}</li></ul>
-      <article v-for="e in report.registration.references" :key="e.message_id" class="ref-entry"><small>{{e.speaker==='user'?'你':'陈浩'}} · 登记对话</small><blockquote>{{e.quote}}</blockquote><a :href="link(e)">定位原话 <CornerDownLeft :size="13"/></a></article>
+      <article v-for="(e,index) in report.registration.references" :key="index" class="ref-entry"><small>{{e.speaker==='user'?'你':'陈浩'}} · 登记对话</small><blockquote>{{e.quote}}</blockquote><a :href="link(e)">定位原话 <CornerDownLeft :size="13"/></a></article>
       <article v-for="turn in turns" :key="turn[0].message_id" class="ref-entry">
-        <div v-for="e in turn" :key="e.field"><small>你 · {{fieldLabel(e.field)}} · {{statusText[e.status]}}</small><blockquote>{{e.quote}}</blockquote></div>
+        <div v-for="(e,index) in turn" :key="index"><small>你 · {{fieldLabel(e.field)}} · {{statusText[e.status]}}</small><blockquote>{{e.quote}}</blockquote></div>
         <a :href="chenLink(turn[0].message_id)">定位你的原话 <CornerDownLeft :size="13"/></a>
         <p>陈浩当时的回复</p><blockquote>{{turn[0].reply_quote}}</blockquote><a :href="chenLink(turn[0].reply_id)">定位陈浩原话 <CornerDownLeft :size="13"/></a>
       </article>

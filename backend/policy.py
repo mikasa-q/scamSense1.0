@@ -9,7 +9,8 @@ from .registration import FIELDS, FieldKey, Status
 
 Role = Literal['lin', 'chen', 'wang']
 Focus = Literal['K01', 'K02', 'K03', 'K04', 'K05', 'none']
-ActionKind = Literal['interest', 'respond_registration', 'decline', 'ask_employer', 'ask_data', 'verify_official', 'verify_friend', 'identify_gap', 'weigh_sources']
+ActionKind = Literal['interest', 'respond_registration', 'decline', 'resume_registration', 'ask_employer', 'ask_data', 'verify_official', 'verify_friend', 'identify_gap', 'weigh_sources']
+REGISTRATION_ACTIONS = {'respond_registration', 'decline', 'resume_registration'}
 
 class Action(BaseModel):
     kind: ActionKind
@@ -19,6 +20,7 @@ class Action(BaseModel):
     opportunity: Literal['lin', 'chen'] | None = None
     field: FieldKey | None = None
     status: Status | None = None
+    position: int | None = Field(default=None, ge=0, lt=600)
 
 class Analysis(BaseModel):
     actions: list[Action] = Field(max_length=10)
@@ -55,12 +57,14 @@ FACTS = {
 }
 FOCI = {'K01': '招聘主体与授权关系', 'K02': '资料用途与必要性', 'K03': '保存期限与第三方处理', 'K04': '可独立核对的官方依据', 'K05': '同学是否亲自核实'}
 RULES = {
-    'interest': {'none'}, 'respond_registration': {'none'}, 'decline': {'none'},
+    'interest': {'none'}, 'respond_registration': {'none'}, 'decline': {'none'}, 'resume_registration': {'none'},
     'ask_employer': {'K01'}, 'ask_data': {'K02','K03'}, 'verify_official': {'K04'}, 'verify_friend': {'K05'},
     'identify_gap': set(FOCI), 'weigh_sources': set(FOCI),
 }
 ASKS = {'ask_employer','ask_data','verify_official','verify_friend'}
 WHY = {
+    'decline': '你明确停止了整个登记，不再主动邀请。',
+    'resume_registration': '你主动提出恢复登记，不代表已经提交资料。',
     'ask_employer': '你主动询问了招聘主体或招聘授权。', 'ask_data': '你主动追问了资料的处理或必要性。',
     'verify_official': '你主动寻找了可以独立核对的依据；提问不等于已核实。', 'verify_friend': '你向同学本人核对消息来源，而非把转发当作确认。',
     'identify_gap': '你用自己的话指出了这条信息仍缺少什么依据。', 'weigh_sources': '你区分了信息来源，说明了现有材料不能证明什么。',
@@ -87,7 +91,7 @@ def check_generated(body):
             raise ValueError('sensitive solicitation')
 
 def validate_actions(analysis, body, role, registered):
-    result, seen = [], set()
+    result, seen = [], {}
     for a in analysis.actions:
         if a.source != 'own' or not a.quote.strip() or a.quote not in body or a.focus not in RULES[a.kind]:
             continue
@@ -95,7 +99,7 @@ def validate_actions(analysis, body, role, registered):
             continue
         if a.kind == 'verify_friend' and role != 'wang':
             continue
-        if a.kind in {'respond_registration', 'decline'} and role != 'chen':
+        if a.kind in REGISTRATION_ACTIONS and role != 'chen':
             continue
         if a.kind == 'respond_registration':
             if not registered or not a.field or not a.status:
@@ -104,28 +108,53 @@ def validate_actions(analysis, body, role, registered):
                 raise ValueError('submission requires the field’s fictional value in the user quote')
         elif a.field or a.status:
             continue
-        key = (a.kind, a.focus, a.field)
-        if key not in seen:
-            result.append(a)
-            seen.add(key)
-    return result
+        pos = body.index(a.quote)
+        if a.kind in REGISTRATION_ACTIONS:
+            if a.position is not None:
+                pos = a.position
+                if not body.startswith(a.quote, pos):
+                    raise ValueError('registration quote position does not match the message')
+            elif body.find(a.quote, pos + 1) != -1:
+                raise ValueError('ambiguous registration quote position')
+            a = a.model_copy(update={'position': pos})
+        key = (a.kind, a.focus, a.field, a.position if a.kind in REGISTRATION_ACTIONS else None)
+        if key in seen:
+            if seen[key] != a.status:
+                raise ValueError('conflicting registration choices at the same position')
+            continue
+        result.append((pos, a))
+        seen[key] = a.status
+    return [a for _, a in sorted(result, key=lambda item: item[0])]
+
+
+def invitation_allowed(registration, actions):
+    if registration is None:
+        return False
+    paused, invite = registration['declined_all'], False
+    for a in actions:
+        if a.kind == 'decline':
+            paused, invite = True, False
+        elif a.kind == 'resume_registration' and paused:
+            paused, invite = False, True
+        elif a.kind == 'interest' and not paused and not registration['invited']:
+            invite = True
+    return invite
+
 
 def permission(role, actions, previous, registration):
     wanted = set(previous) | {a.focus for a in actions if a.kind in ASKS}
     facts = {k:v for k,v in FACTS[role].items() if k in wanted}
-    invite = (role == 'chen' and not registration['invited'] and not registration['declined_all']
-              and any(a.kind == 'interest' for a in actions) and not any(a.kind == 'decline' for a in actions))
-    return facts, invite
+    return facts, role == 'chen' and invitation_allowed(registration, actions)
 
-def validate_reply(reply, audit, actions, facts, previous, invite):
+def validate_reply(reply, audit, actions, facts, previous, registration):
     body = reply.body.strip()
     if not audit.safe:
         raise ValueError('unapproved reply')
     if any(i < 0 or i >= len(actions) for i in audit.supported):
         raise ValueError('invalid evidence indexes')
     valid = [a for i,a in enumerate(actions) if i in audit.supported]
-    if any(a.kind == 'respond_registration' and i not in audit.supported for i, a in enumerate(actions)):
-        raise ValueError('reply based on an unverified field choice')
+    if any(a.kind in REGISTRATION_ACTIONS and i not in audit.supported for i, a in enumerate(actions)):
+        raise ValueError('reply based on an unverified registration choice')
     allowed = {a.focus for a in valid if a.kind in ASKS}
     # A candidate rejected during audit cannot open a new fact gate.
     if (set(facts) - set(previous)) - allowed:
@@ -138,8 +167,9 @@ def validate_reply(reply, audit, actions, facts, previous, invite):
             continue
         disclosed.setdefault(d.focus, d.quote)
     reg = audit.registration_quote
-    if invite and any(a.kind == 'interest' for a in valid) and reg is None:
-        raise ValueError('missing invitation evidence')
-    if reg is not None and (not reg.strip() or reg not in body or not invite or not any(a.kind == 'interest' for a in valid)):
+    invite = invitation_allowed(registration, valid)
+    if invite and reg is None and not registration['invited']:
+        raise ValueError('missing first invitation evidence')
+    if reg is not None and (not reg.strip() or reg not in body or not invite):
         raise ValueError('unapproved registration')
     return body, valid, disclosed, reg
