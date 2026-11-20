@@ -1,7 +1,7 @@
 import re
 import unicodedata
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Role = Literal['lin', 'chen', 'wang']
 Focus = Literal['K01', 'K02', 'K03', 'K04', 'K05', 'none']
@@ -24,7 +24,8 @@ class Disclosure(BaseModel):
     quote: str = Field(min_length=2, max_length=800)
 
 class K05Claim(BaseModel):
-    quote: str = Field(min_length=1, max_length=800)
+    model_config = ConfigDict(extra='forbid')
+    part_id: int = Field(strict=True, ge=0)
     kind: Literal['origin', 'other_person', 'uncertain', 'self_denies_job_check', 'other']
 
 class Audit(BaseModel):
@@ -98,7 +99,8 @@ def permission(role, actions, previous, refused):
     return facts, invite
 
 def k05_parts(body):
-    return [part.strip() for part in re.split(r'[，,。！？!?；;\n]+', body) if part.strip()]
+    marks = '，,。！？!?；;\n'
+    return re.findall(rf'[{marks}]*[^{marks}]+[{marks}]*', body.strip())
 
 def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
     body = reply.body.strip()
@@ -111,24 +113,27 @@ def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
     # A candidate rejected during audit cannot open a new fact gate.
     if (set(facts) - set(previous)) - allowed:
         raise ValueError('unverified permission')
+    parts = k05_parts(body) if role == 'wang' else []
     disclosed = {}
     for d in audit.disclosures:
-        if d.focus not in facts or d.quote not in body or (d.focus == 'K05' and role != 'wang'):
+        if d.focus not in facts or d.quote not in body:
             raise ValueError('unattributed disclosure')
         if d.focus != 'K05':
             disclosed.setdefault(d.focus, d.quote)
+        elif role != 'wang' or (d.quote != body and d.quote not in parts):
+            raise ValueError('unexpected K05 excerpt')
     if (role == 'wang') != (audit.k05 is not None):
         raise ValueError('missing or out-of-scope K05 assessment')
-    for claim in audit.k05 or []:
-        if not claim.quote.strip() or claim.quote not in body:
-            raise ValueError('unattributed K05 quote')
-        if claim.kind == 'self_denies_job_check':
-            if 'K05' not in facts:
-                raise ValueError('unapproved K05 disclosure')
-            disclosed.setdefault('K05', claim.quote)
-    if audit.k05 is not None and 'K05' not in disclosed:
-        if any(not any(part in c.quote for c in audit.k05) for part in k05_parts(body)):
-            raise ValueError('incomplete negative K05 assessment')
+    if audit.k05 is not None:
+        ids = sorted(claim.part_id for claim in audit.k05)
+        if ids != list(range(len(parts))):
+            raise ValueError('invalid or incomplete K05 part IDs')
+        kinds = {claim.kind for claim in audit.k05}
+        if 'self_denies_job_check' in kinds:
+            if 'K05' not in facts or 'uncertain' in kinds:
+                raise ValueError('unapproved or contradictory K05 disclosure')
+            # A later clause can qualify an earlier one, so cite the intact Wang reply.
+            disclosed['K05'] = body
     reg = audit.registration_quote
     if reg is not None and (not reg.strip() or reg not in body or not invite or not any(a.kind == 'interest' for a in valid)):
         raise ValueError('unapproved registration')

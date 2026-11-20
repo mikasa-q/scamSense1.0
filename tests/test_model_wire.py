@@ -12,7 +12,7 @@ import pytest
 from backend.db import ROOT
 from backend.main import create_app
 from backend.model import CompatibleModel, K05_INTERPRET, GENERATE, K05_AUDIT
-from backend.policy import Action, FACTS
+from backend.policy import Action, FACTS, Reply, k05_parts, validate_reply
 
 QUESTION = '这机会你亲自问过招聘方吗？'
 JUDGMENT = '群里转发不能证明招聘方获得了授权。'
@@ -37,7 +37,8 @@ def wire_fixture():
             elif system == GENERATE:
                 result = {'body':REPLY if msg == QUESTION else '明白，你想先找依据。'}
             elif system == K05_AUDIT:
-                finding = [{'quote':data['reply'], 'kind':'self_denies_job_check' if msg == QUESTION else 'other'}]
+                kinds = ['self_denies_job_check','origin'] if msg == QUESTION else ['other','other']
+                finding = [{'part_id':i, 'kind':kind} for i, kind in enumerate(kinds)]
                 result = {'safe':True,'supported':list(range(len(data['candidates']))),'disclosures':[],'registration_quote':None,'k05':finding}
             else:
                 self.send_error(400); return
@@ -64,6 +65,7 @@ def test_two_turns_through_compatible_http_contract(tmp_path, monkeypatch):
         assert len(calls) == 6
         assert [prompt for prompt,_ in calls] == [K05_INTERPRET,GENERATE,K05_AUDIT]*2
         assert calls[2][1]['current_user'] == QUESTION and calls[2][1]['reply'] == REPLY
+        assert calls[2][1]['reply_parts'] == [{'part_id':0, 'text':'没有，'}, {'part_id':1, 'text':'群里看到的。'}]
         assert calls[5][1]['private_history'] == [{'speaker':'user','text':QUESTION}, {'speaker':'assistant','text':REPLY}]
         ref, = report['disclosures']
         assert (ref['focus'],ref['speaker'],ref['message_id'],ref['quote']) == ('K05','assistant',2,REPLY)
@@ -86,7 +88,8 @@ def test_live_k05_judgment(question, reply, evidence):
     action = Action(kind='verify_friend', focus='K05', quote=question, source='own')
     audit = asyncio.run(CompatibleModel().audit('wang', [], question, FACTS['wang'], False, [action], reply))
     assert audit.supported == [0] and audit.k05 is not None
-    assert all(claim.quote.strip() and claim.quote in reply for claim in audit.k05)
-    denied = [claim.quote for claim in audit.k05 if claim.kind == 'self_denies_job_check']
-    assert bool(denied) == bool(evidence)
-    assert all(any(part in quote for part in evidence) for quote in denied)
+    _, _, disclosed, _ = validate_reply(Reply(body=reply), audit, [action], FACTS['wang'], set(), False, role='wang')
+    assert disclosed == ({'K05':reply} if evidence else {})
+    parts = k05_parts(reply)
+    denied = [parts[claim.part_id] for claim in audit.k05 if claim.kind == 'self_denies_job_check']
+    assert all(any(fragment in part for fragment in evidence) for part in denied)
