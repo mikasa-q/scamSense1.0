@@ -312,4 +312,5 @@ def test_semantic_adapter_payload_is_role_scoped_and_not_resolved_on_client(lab,
     reply = asyncio.run(adapter.reply('wang',[],ASK,{'K05':'本人没有核实。'},False))
     context = json.loads(captured[0]['messages'][1]['content'])
     assert reply.body == '这只是当前角色的回答。' and context['private_history'] == []
-    assert set(context['permitted_facts']) == {'K05'} and '陈浩' not in context['character']
+    assert set(context['permitted_facts']) == {'K05'}
+    assert context['character']['name'] == '王宇' and '陈浩' not in json.dumps(context['character'], ensure_ascii=False)
