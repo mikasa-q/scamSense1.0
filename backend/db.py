@@ -86,6 +86,18 @@ class Trace(Base):
     quote: Mapped[str] = mapped_column(Text)
     why: Mapped[str] = mapped_column(Text)
 
+class RegistrationEntry(Base):
+    __tablename__ = 'registration_entries'
+    __table_args__ = (UniqueConstraint('message_id', 'field', 'position', name='uq_registration_field_position'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sid: Mapped[str] = mapped_column(ForeignKey('trainings.id'), index=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey('messages.id'))
+    reply_id: Mapped[int] = mapped_column(ForeignKey('messages.id'))
+    position: Mapped[int] = mapped_column(Integer)
+    field: Mapped[str] = mapped_column(String(24))
+    status: Mapped[str] = mapped_column(String(12))
+    quote: Mapped[str] = mapped_column(Text)
+
 class Ending(Base):
     __tablename__ = 'endings'
     sid: Mapped[str] = mapped_column(ForeignKey('trainings.id'), primary_key=True)

@@ -5,6 +5,7 @@ import {keys, roles, scene, stages, timeText, privateText, type Role, type Sessi
 import {sendTurn} from '../api'
 import Portrait from './Portrait.vue'
 import EndDialog from './EndDialog.vue'
+import RegistrationPanel from './RegistrationPanel.vue'
 const props=defineProps<{session:Session; record:RecordItem; role:Role; target:number; configured:boolean|null}>()
 const emit=defineEmits<{saved:[s:Session]; reload:[]; check:[]; ended:[]}>()
 const visibleMessages=computed(()=>props.session.messages.filter(m=>m.role===props.role))
@@ -19,7 +20,12 @@ async function position() {await nextTick(); const target=props.target && docume
 onMounted(position)
 watch(()=>[props.role, props.target],()=>{text.value=''; failure.value=''; lastRequest.value=null; position()})
 watch(()=>[visibleMessages.value.length,progress.value],position)
-function suggest(v:string) {text.value=v; input.value?.focus()}
+function suggest(v:string) {
+  const draft=text.value ? `${text.value}，${v}` : v
+  if(draft.length>600) failure.value='追加后超过 600 字，请先缩短草稿。'
+  else {text.value=draft; failure.value=''}
+  input.value?.focus()
+}
 async function send() {
   const body=text.value.trim(); if(!body || locked.value || props.session.closed) return
   if(privateText(body)) { failure.value='请移除疑似真实的个人资料，改用「虚构资料 A」等占位文字。'; return }
@@ -39,7 +45,8 @@ function enter(e:KeyboardEvent) {if(e.key==='Enter' && !e.isComposing && !e.shif
       <div ref="scroll" class="thread-scroll" role="log" aria-label="私聊记录" aria-live="polite"><div v-if="!visibleMessages.length" class="empty-thread"><span class="empty-icon"><MessageCircle :size="24"/></span><h3>与{{roleInfo.name}}的私聊</h3><p>{{roleInfo.intro}}</p><button v-if="!session.closed" class="prompt-chip" :disabled="locked" @click="suggest(roleInfo.ask)">试着问：{{roleInfo.ask}} <ArrowRight :size="13"/></button></div>
         <div v-for="m in visibleMessages" :id="`msg-${m.id}`" :key="m.id" :class="['message',m.speaker,{highlight:target===m.id}]" tabindex="-1"><small>{{m.speaker==='user'?'你':roleInfo.name}} · {{timeText(m.created)}} <span v-if="target===m.id"> / 复盘引文所在消息</span></small><p>{{m.body}}</p></div>
         <div v-if="sending" class="message user draft-bubble"><small>你 · 待校验，尚未写入</small><p>{{pendingText}}</p></div><div v-if="locked" class="working"><i></i>{{progress || '上一次发言仍在处理，完成后自动恢复。'}}</div></div>
-      <div v-if="!session.closed" class="composer"><div v-if="failure" class="field-error" role="alert">{{failure}}</div><div v-if="role==='chen' && session.registered" class="small-prompts"><button v-for="s in ['我暂不参与预登记。','我只愿意提供虚构意向，不提供其他资料。']" :key="s" :disabled="locked" @click="suggest(s)">{{s}}</button></div><label class="sr-only" for="message">发给{{roleInfo.name}}的消息</label><textarea id="message" ref="input" v-model="text" maxlength="600" rows="3" :disabled="locked" :placeholder="`询问${roleInfo.name}…  请勿输入真实个人资料`" @keydown="enter"/><div class="composer-foot"><small>Enter 发送 · Shift + Enter 换行</small><button class="btn primary small" :disabled="!text.trim()||locked" @click="send">{{sending?'处理中':'发送'}}<SendHorizontal :size="15"/></button></div></div>
+      <RegistrationPanel v-if="role==='chen' && session.registered" :registration="session.registration" :sid="session.id" :closed="session.closed" :locked="locked" @draft="suggest"/>
+      <div v-if="!session.closed" class="composer"><div v-if="failure" class="field-error" role="alert">{{failure}}</div><div v-if="role==='chen'" class="small-prompts"><button v-for="s in (session.registration.declined_all ? ['我想重新开始整个预登记。'] : session.registered ? ['登记资料用来做什么？','我停止整个预登记。'] : ['我对你介绍的岗位感兴趣。'])" :key="s" :disabled="locked" @click="suggest(s)">{{s}}</button></div><label class="sr-only" for="message">发给{{roleInfo.name}}的消息</label><textarea id="message" ref="input" v-model="text" maxlength="600" rows="3" :disabled="locked" :placeholder="`询问${roleInfo.name}…  请勿输入真实个人资料`" @keydown="enter"/><div class="composer-foot"><small>Enter 发送 · Shift + Enter 换行</small><button class="btn primary small" :disabled="!text.trim()||locked" @click="send">{{sending?'处理中':'发送'}}<SendHorizontal :size="15"/></button></div></div>
       <a v-else class="thread-return" :href="`#/review/${session.id}`"><ArrowLeft :size="15"/> 返回本场复盘</a>
     </section></div>
   <div v-if="!session.closed" class="decision-strip"><div><Flag :size="19"/><div><b>你准备好作判断了吗？</b><p>不必聊完所有人，也可以暂不作正式决定。</p></div></div><div class="decision-actions"><button class="text-btn" :disabled="locked" @click="closing='early'">提前结束训练</button><button class="btn primary" :disabled="locked" @click="closing='decision'">作出决策 <ArrowRight :size="15"/></button></div></div>

@@ -6,7 +6,7 @@ import {privateText,roles,type Choice,type RecordItem,type Session} from '../dat
 const props=defineProps<{kind:'early'|'decision';record:RecordItem;session:Session}>()
 const emit=defineEmits<{cancel:[];done:[]}>()
 const dialog=ref<HTMLDialogElement>(); const selected=ref<Choice|null>(null), reason=ref(''), cited=ref<number[]>([]), busy=ref(false), error=ref('')
-const choices:{key:Choice;label:string;desc:string}[]=[{key:'verify',label:'先核实再决定',desc:'暂缓推进，先寻找可独立核对的依据。'},{key:'continue',label:'继续了解机会',desc:'保留机会，继续走招聘流程。'},{key:'leave',label:'退出招聘流程',desc:'明确选择不再参与这次招聘。'}]
+const choices:{key:Choice;label:string;desc:string}[]=[{key:'verify',label:'先核实再决定',desc:'暂缓推进，先寻找可独立核对的依据。'},{key:'continue',label:'继续了解机会',desc:'保留机会，继续走招聘流程。'},{key:'necessary_only',label:'仅提交必要资料',desc:'只打算给经核实确有必要的资料；这个选择不会自动提交任何资料。'},{key:'leave',label:'退出招聘流程',desc:'明确选择不再参与这次招聘。'}]
 onMounted(()=>dialog.value?.showModal())
 async function submit() {if(busy.value) return;error.value='';if(privateText(reason.value)) {error.value='判断理由中疑似含有真实个人资料，请改用虚构占位文字。'; return}busy.value=true
 try {await finishSession(props.record,props.kind==='early'?{kind:'early'}:{kind:'decision',choice:selected.value!,reason:reason.value.trim(),cited:cited.value});emit('done')}

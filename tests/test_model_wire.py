@@ -11,7 +11,7 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from backend.db import ROOT
 from backend.main import create_app
-from backend.model import AUDIT, GENERATE, INTERPRET, K05_ACTIONS, K05_AUDIT, K05_INTERPRET, CompatibleModel
+from backend.model import AUDIT, CHEN_AUDIT, CHEN_GENERATE, CHEN_INTERPRET, GENERATE, INTERPRET, K05_ACTIONS, K05_AUDIT, K05_INTERPRET, CompatibleModel
 from backend.policy import Action, FACTS, Reply, k05_parts, validate_reply
 
 QUESTION = '这机会你亲自问过招聘方吗？'
@@ -22,7 +22,23 @@ SOURCE_QUESTION = '你从哪看到的？'
 HELLO = '你好。'
 AUTH_QUESTION = '你能说明这次招聘的委托关系吗？'
 AUTH_REPLY = '我目前无法出示可核实的企业招聘授权。'
+INTEREST = '我对你介绍的岗位感兴趣。'
+INVITE = '如果愿意，可以做虚构预登记。项目经历和所在城市都可自行选择，不用给真实资料。'
+MIXED = '项目经历可以给，所在城市先不提供'
+STOP = '我停止整个预登记。'
+ATTEMPT = '我提交的项目经历：虚构项目 A'
+PURPOSE = '登记资料用来做什么？'
+
+def registration_action(kind, quote, **fields):
+    return dict(kind=kind, focus='none', source='own', quote=quote, **fields)
+
 TURNS = {
+    INTEREST: ([registration_action('interest', INTEREST, opportunity='chen')], INVITE, [], ()),
+    MIXED: ([registration_action('respond_registration', '项目经历可以给', field='project_experience', status='agreed'),
+             registration_action('respond_registration', '所在城市先不提供', field='city', status='deferred')], '项目经历只是愿意提供，城市暂缓。两项都还没有提交。', [], ()),
+    STOP: ([registration_action('decline', STOP)], '好的，预登记已停止，可以继续聊岗位。', [], ()),
+    ATTEMPT: ([registration_action('respond_registration', ATTEMPT, field='project_experience', status='submitted')], '预登记仍已停止，本次没有收下项目资料。', [], ()),
+    PURPOSE: ([('ask_data', 'K02')], '原本说是用来汇总意向和安排面试。', [], ()),
     HELLO: ([], '你好，有什么想了解的？', [], ('other','other')),
     QUESTION: ([('verify_friend','K05')], REPLY, [], ('self_denies_job_check','origin')),
     MEMORY_QUESTION: ([('verify_friend','K05')], '我记不清当时问过没有。', [], ('uncertain',)),
@@ -45,12 +61,14 @@ def wire_fixture():
                 self.send_error(400); return
             calls.append((system,data))
             pairs, reply, disclosures, kinds = TURNS[msg]
-            if system in (INTERPRET, K05_INTERPRET):
-                result = {'actions':[{'kind':k,'focus':f,'quote':msg,'source':'own'} for k,f in pairs]}
-            elif system == GENERATE:
+            if system in (INTERPRET, K05_INTERPRET, CHEN_INTERPRET):
+                result = {'actions':[p if isinstance(p, dict) else {'kind':p[0],'focus':p[1],'quote':msg,'source':'own'} for p in pairs]}
+            elif system in (GENERATE, CHEN_GENERATE):
                 result = {'body':reply}
-            elif system in (AUDIT, K05_AUDIT):
+            elif system in (AUDIT, K05_AUDIT, CHEN_AUDIT):
                 result = {'safe':True,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':None}
+                if system == CHEN_AUDIT:
+                    result.update(received_now=[], registration_quote=reply if msg == INTEREST else None)
                 if system == K05_AUDIT:
                     result['k05'] = [{'part_id':i, 'kind':kind} for i, kind in enumerate(kinds)]
             else:
@@ -125,6 +143,47 @@ def test_two_turns_through_compatible_http_contract(wired_session, question, exp
     assert (risk['speaker'],risk['message_id'],risk['quote']) == ('user',3,JUDGMENT)
 
 
+def test_stopped_registration_blocks_a_supported_submission_and_keeps_k05_private(wired_session):
+    client, path, headers, calls = wired_session
+    def send(role, text, rid=None):
+        result = client.post(path+'/turns', headers=headers, json={'role':role, 'text':text, 'request_id':rid or str(uuid4())})
+        assert 'event: done' in result.text, result.text
+        return result
+    for text in (INTEREST, MIXED, STOP):
+        send('chen', text)
+    stopped = client.get(path, headers=headers).json()['registration']
+    assert stopped['declined_all'] and [i['status'] for i in stopped['items']] == ['agreed','deferred']
+    assert stopped['submitted'] == [] and len(stopped['history']) == 2
+    rid = str(uuid4())
+    send('chen', ATTEMPT, rid)
+    generation, audit = (data for _,data in calls[-2:])
+    assert audit['candidates'][0]['status'] == 'submitted'  # The independent stub even supports it.
+    assert audit['registration'] == generation['registration']
+    assert generation['registration']['stopped_after'] and generation['registration']['this_turn'] == []
+    assert not generation['allow_invitation']
+    count = len(calls)
+    assert '"cached":true' in send('chen', ATTEMPT, rid).text and len(calls) == count
+    send('chen', PURPOSE)
+    assert not calls[-2][1]['allow_invitation'] and 'K02' in calls[-2][1]['permitted_facts']
+    for role, text in [('lin',HELLO), ('wang',QUESTION)]:
+        send(role, text)
+        for _, data in calls[-3:]:
+            assert 'registration' not in data and data['private_history'] == [] and ATTEMPT not in str(data)
+    with TestClient(create_app()) as fresh:
+        snap = fresh.get(path, headers=headers).json()
+        assert snap['registration'] == stopped
+        by_id = {m['id']:m for m in snap['messages']}
+        for entry in stopped['history']:
+            assert entry['quote'] in by_id[entry['message_id']]['body'] and by_id[entry['message_id']]['speaker'] == 'user'
+            assert entry['reply_quote'] == by_id[entry['reply_id']]['body']
+        report = fresh.post(path+'/finish', headers=headers, json={'kind':'decision','choice':'necessary_only'}).json()
+        assert report['ending']['label'] == '仅提交必要资料'
+        assert report['registration']['history'] == stopped['history'] and report['registration']['submitted'] == []
+        assert [ref['quote'] for ref in report['registration']['references']] == [INVITE, STOP]
+        assert [(d['focus'],d['speaker'],d['quote']) for d in report['disclosures']] == [('K05','assistant',REPLY)]
+        assert not next(d for d in report['dimensions'] if d['key'] == 'risk')['evidence']
+
+
 def test_model_receives_only_the_active_role_card(wired_session):
     client, path, headers, calls = wired_session
     profiles = {
@@ -139,7 +198,13 @@ def test_model_receives_only_the_active_role_card(wired_session):
         expected_analysis = {'contact':name, 'private_history':[], 'current_user':HELLO}
         if role == 'wang':
             expected_analysis['source_action_guide'] = K05_ACTIONS
-        prompts = [K05_INTERPRET,GENERATE,K05_AUDIT] if role == 'wang' else [INTERPRET,GENERATE,AUDIT]
+        if role == 'chen':
+            state = client.get(path, headers=headers).json()['registration']
+            expected_analysis['registration'] = {k: state[k] for k in ('items', 'submitted', 'declined_all')} | {'invited':False}
+            assert generation['registration']['this_turn'] == []
+        else:
+            assert all('registration' not in payload for payload in (analysis, generation, audit))
+        prompts = {'wang':[K05_INTERPRET,GENERATE,K05_AUDIT], 'chen':[CHEN_INTERPRET,CHEN_GENERATE,CHEN_AUDIT], 'lin':[INTERPRET,GENERATE,AUDIT]}[role]
         assert [prompt for prompt,_ in calls[-3:]] == prompts
         assert analysis == expected_analysis
         assert ('reply_parts' in audit) == (role == 'wang')
