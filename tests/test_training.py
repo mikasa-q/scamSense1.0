@@ -10,7 +10,7 @@ from backend import training
 from backend.db import ROOT, Receipt, StoryEvent, Trace, Training
 from backend.main import create_app
 from backend.model import CompatibleModel
-from backend.policy import Action, Analysis, Audit, Disclosure, Reply
+from backend.policy import Action, Analysis, Audit, ChenAudit, Disclosure, Reply
 
 ASK = '你亲自核实过这个岗位吗？'
 ANSWER = '我在校园群里看到转发，没亲自核实。'
@@ -20,8 +20,8 @@ DENIAL = 'self_denies_job_check'
 def labels(*kinds):
     return [{'part_id':i, 'kind':kind} for i, kind in enumerate(kinds)]
 
-def action(kind, focus, quote, source='own'):
-    return Action(kind=kind, focus=focus, quote=quote, source=source)
+def action(kind, focus, quote, source='own', **attrs):
+    return Action(kind=kind, focus=focus, quote=quote, source=source, **attrs)
 
 class ScriptedModel:
     configured = True
@@ -34,19 +34,21 @@ class ScriptedModel:
         self.safe = True
         self.break_at = None
         self.reg = None
+        self.received = []
         self.calls = []
-    async def analyze(self, role, history, text):
+    async def analyze(self, role, history, text, registration):
         self.calls.append(('analysis',role,history,text))
         if self.break_at == 'analysis': raise RuntimeError()
         return Analysis(actions=self.actions)
-    async def reply(self, role, history, text, facts, invite):
+    async def reply(self, role, history, text, facts, invite, registration):
         self.calls.append(('reply',role,history,dict(facts),invite))
         if self.break_at == 'reply': raise RuntimeError()
         return Reply(body=self.body)
-    async def audit(self, role, history, text, facts, invite, actions, body):
+    async def audit(self, role, history, text, facts, invite, actions, body, registration):
         self.calls.append(('audit',role,history,dict(facts),invite))
         if self.break_at == 'audit': raise RuntimeError()
-        return Audit(safe=self.safe, supported=list(range(len(actions))) if self.supported is None else self.supported, disclosures=self.disclosures, registration_quote=self.reg, k05=self.k05 if role == 'wang' else None)
+        evidence = dict(safe=self.safe, supported=list(range(len(actions))) if self.supported is None else self.supported, disclosures=self.disclosures, registration_quote=self.reg)
+        return ChenAudit(**evidence, received_now=self.received) if role == 'chen' else Audit(**evidence, k05=self.k05 if role == 'wang' else None)
 
 @pytest.fixture
 def lab(tmp_path, monkeypatch):
@@ -294,12 +296,207 @@ def test_concurrent_and_stale_attempts_cannot_commit(lab):
 
 def test_registration_is_an_actual_proposal_and_refusal_is_respected(lab):
     model = lab.model; interested = '我想了解这个岗位。'
-    model.actions,model.disclosures = [action('interest','none',interested)],[]
+    model.actions,model.disclosures = [action('interest','none',interested,opportunity='chen')],[]
     model.body,model.reg = '可以做虚构意向预登记，不需要实际资料。','可以做虚构意向预登记'
     lab.post(interested,'chen');assert lab.snap()['registered'] and lab.snap()['stage'] == 2
     no = '我不愿意登记。';model.actions = [action('decline','none',no)];model.reg=None;model.body='明白，我尊重你的决定。'
-    lab.post(no,'chen');model.actions=[action('interest','none',interested)]
+    lab.post(no,'chen');model.actions=[action('interest','none',interested,opportunity='chen')]
     lab.post(interested,'chen');assert model.calls[-2][-1] is False
+
+@pytest.mark.parametrize('role,target,source', [('chen','lin','own'),('lin','chen','own'),('chen','chen','retold'),('wang','chen','own')])
+def test_interest_must_be_own_and_directed_to_consultant(lab, role, target, source):
+    text = '同学对这份实习感兴趣。' if source == 'retold' else '我对林悦的岗位感兴趣。'
+    model = lab.model
+    model.actions = [action('interest','none',text,source,opportunity=target)]
+    model.disclosures, model.body = [], '可以继续核实岗位信息。'
+    model.k05 = labels('other')
+    assert 'event: done' in lab.post(text, role).text
+    assert not model.calls[-2][-1] and not lab.snap()['registered']
+    model.body = model.reg = '要参加预登记吗？'
+    assert 'event: error' in lab.post(text, role).text and not lab.snap()['registered']
+
+
+def propose(lab):
+    model = lab.model
+    interest = '我想应聘你介绍的这个岗位。'
+    model.actions = [action('interest','none',interest,opportunity='chen')]
+    model.disclosures, model.body = [], '可以自愿做虚构资料的预登记。'
+    model.reg = model.body
+    assert 'event: done' in lab.post(interest,'chen').text
+    model.reg = None
+    return model
+
+
+def test_partial_refusal_actual_submission_and_later_change_of_mind(lab):
+    model = propose(lab)
+    project, city = '我提交的项目经历：虚构项目 A', '我拒绝提供所在城市'
+    model.actions = [action('respond_registration','none',project,field='project_experience',status='submitted'),
+                     action('respond_registration','none',city,field='city',status='refused')]
+    model.body = '收到了虚构项目 A，城市不必提供。'
+    assert 'event: done' in lab.post(project+'，'+city,'chen').text
+    r = lab.snap()['registration']
+    assert [i['status'] for i in r['items']] == ['submitted','refused'] and r['submitted'] == ['project_experience']
+    last = '项目经历之后先不提供。'
+    model.actions = [action('respond_registration','none',last,field='project_experience',status='deferred')]
+    model.body = '可以，不需要继续给项目资料。'
+    assert 'event: done' in lab.post(last,'chen').text
+    r = lab.end(kind='decision',choice='necessary_only').json()['registration']
+    assert [i['status'] for i in r['items']] == ['deferred','refused'] and r['submitted'] == ['project_experience']
+    assert [(e['status'], e['quote']) for e in r['history']] == [('submitted',project),('refused',city),('deferred',last)]
+
+
+@pytest.mark.parametrize('first,first_status,last,last_status,submitted', [
+    ('所在城市可以给', 'agreed', '所在城市先不提供', 'deferred', []),
+    ('我提交的所在城市：虚构城市 B', 'submitted', '我拒绝继续提供所在城市', 'refused', ['city']),
+])
+def test_same_turn_corrections_follow_the_source_not_candidate_order(lab, first, first_status, last, last_status, submitted):
+    model = propose(lab)
+    earlier = action('respond_registration', 'none', first, field='city', status=first_status)
+    later = action('respond_registration', 'none', last, field='city', status=last_status)
+    model.actions, model.body = [later, earlier, earlier], '明白，按你最后说的办。'
+    text, rid = first + '。算了，' + last, str(uuid4())
+    assert 'event: done' in lab.post(text, 'chen', rid).text
+    assert '"cached":true' in lab.post(text, 'chen', rid).text
+    snap = lab.snap()
+    city = next(i for i in snap['registration']['items'] if i['key'] == 'city')
+    assert (city['status'], city['quote']) == (last_status, last)
+    r = lab.end(kind='early').json()['registration']
+    assert r['items'] == snap['registration']['items'] and r['submitted'] == submitted
+    assert [(e['status'], e['quote']) for e in r['history']] == [(first_status, first), (last_status, last)]
+    assert all((e['message_id'], e['reply_id']) == tuple(m['id'] for m in snap['messages'][-2:]) for e in r['history'])
+
+
+def test_repeated_quote_needs_a_verified_position(lab):
+    model = propose(lab)
+    yes, no = '所在城市可以给', '所在城市先不提供'
+    text = f'{yes}。{no}。{yes}'
+    def city(quote, status, **attrs):
+        return action('respond_registration', 'none', quote, field='city', status=status, **attrs)
+    model.body = '明白，最后是愿意给，但还没有提交。'
+    for ambiguous in [city(yes, 'agreed'), city(yes, 'agreed', position=1)]:
+        model.actions = [ambiguous]
+        before = lab.snap()
+        assert 'event: error' in lab.post(text, 'chen').text and lab.snap() == before
+    model.actions = [city(yes, 'agreed', position=text.rindex(yes)), city(no, 'deferred'), city(yes, 'agreed', position=0)]
+    assert 'event: done' in lab.post(text, 'chen').text
+    r = lab.end(kind='early').json()['registration']
+    assert [e['quote'] for e in r['history']] == [yes, no, yes]
+    assert r['submitted'] == [] and r['items'][1]['status'] == 'agreed'
+
+
+@pytest.mark.parametrize('previous_invitation', [False, True])
+def test_only_explicit_audited_reopening_overrides_whole_decline(lab, previous_invitation):
+    model = propose(lab) if previous_invitation else lab.model
+    stop, interest, resume = '我拒绝整个登记。', '我对你的岗位仍然感兴趣。', '我改主意了，现在想登记'
+    model.actions, model.disclosures, model.body = [action('decline', 'none', stop)], [], '好的，不再邀请你登记。'
+    assert 'event: done' in lab.post(stop, 'chen').text
+    model.actions = [action('interest', 'none', interest, opportunity='chen')]
+    model.body = '可以继续了解这个岗位。'
+    assert 'event: done' in lab.post(interest, 'chen').text and not model.calls[-2][-1]
+    model.actions = [action('resume_registration', 'none', resume)]
+    model.body, model.reg = '好的，可以继续聊。', None
+    before = lab.snap()
+    model.supported = []
+    assert 'event: error' in lab.post(resume, 'chen').text and lab.snap() == before
+    model.supported = None
+    assert 'event: done' in lab.post(resume, 'chen').text and not model.calls[-2][-1]
+    assert not training.private_context(lab.app.state.factory, lab.sid, 'chen')[2]['declined_all']
+    model.actions, model.reg, model.body = [action('interest', 'none', interest, opportunity='chen')], None, '我们继续聊岗位。'
+    assert 'event: done' in lab.post(interest, 'chen').text and model.calls[-2][-1] is (not previous_invitation)
+    assert lab.snap()['registered'] is previous_invitation
+    r = lab.end(kind='early').json()['registration']
+    assert r['submitted'] == [] and [e['quote'] for e in r['references'] if e['speaker'] == 'user'] == [stop, resume]
+
+
+@pytest.mark.parametrize('failure',['intent_only','other_fields_value','unsupported','unsafe'])
+def test_unverified_item_changes_never_commit(lab, failure):
+    model = propose(lab)
+    text = {'intent_only':'我可以提供项目经历', 'other_fields_value':'项目经历：虚构城市 B'}.get(failure,'项目经历：虚构项目 A')
+    model.actions = [action('respond_registration','none',text,field='project_experience',status='submitted')]
+    model.body = '我收到了项目经历。'
+    if failure == 'unsupported': model.supported = []
+    if failure == 'unsafe': model.safe = False
+    before = lab.snap()
+    assert 'event: error' in lab.post(text,'chen').text
+    after = lab.snap()
+    assert after['registration'] == before['registration'] and after['messages'] == before['messages']
+
+
+def stop_registration(lab):
+    model = propose(lab)
+    stop = '我要停止整个预登记。'
+    model.actions, model.body = [action('decline','none',stop)], '明白，预登记已停止。'
+    assert 'event: done' in lab.post(stop, 'chen').text
+    return model
+
+
+@pytest.mark.parametrize('support_resume', [False, True])
+def test_same_turn_resume_only_authorizes_later_items(lab, support_resume):
+    model = stop_registration(lab)
+    early, resume, late = '我提交的项目经历：虚构项目 A', '我明确重新开始整个登记', '我现在提交所在城市：虚构城市 B'
+    model.actions = [action('respond_registration','none',late,field='city',status='submitted'),
+                     action('resume_registration','none',resume),
+                     action('respond_registration','none',early,field='project_experience',status='submitted')]
+    model.body, model.received = '已恢复，这次只收到了虚构城市 B。', ['city']
+    model.supported = [0,1,2] if support_resume else [0,2]
+    before = lab.snap()
+    result = lab.post('。'.join([early,resume,late]), 'chen')
+    if not support_resume:
+        assert 'event: error' in result.text and lab.snap() == before
+        return
+    assert 'event: done' in result.text
+    state = lab.snap()['registration']
+    assert not state['declined_all'] and state['submitted'] == ['city']
+    assert [(e['field'],e['quote']) for e in state['history']] == [('city',late)]
+
+
+def test_same_turn_stop_blocks_later_field_and_false_receipt_is_not_saved(lab):
+    model = propose(lab)
+    stop, field = '不再参与整个登记', '我提交的项目经历：虚构项目 A'
+    model.actions = [action('respond_registration', 'none', field, field='project_experience', status='submitted'), action('decline', 'none', stop)]
+    model.body, model.received = '已停止，不过已收到项目经历。', ['project_experience']
+    before = lab.snap()
+    assert 'event: error' in lab.post(stop+'。'+field, 'chen').text and lab.snap() == before
+    model.body, model.received = '已停止，本次没有收取资料。', []
+    assert 'event: done' in lab.post(stop+'。'+field, 'chen').text
+    state = lab.snap()['registration']
+    assert state['declined_all'] and state['history'] == state['submitted'] == []
+
+
+def test_future_promise_with_exact_placeholder_is_not_a_submission(lab):
+    model = propose(lab)
+    text = '以后我会给虚构项目 A'
+    model.actions = [action('respond_registration','none',text,field='project_experience',status='submitted')]
+    model.supported, model.body = [], '收到项目资料了。'
+    before = lab.snap()
+    assert 'event: error' in lab.post(text,'chen').text and lab.snap() == before
+    model.actions = [action('respond_registration','none',text,field='project_experience',status='agreed')]
+    model.supported, model.body = [0], '明白，现在不需要提供。'
+    assert 'event: done' in lab.post(text,'chen').text
+    state = lab.snap()['registration']
+    assert state['items'][0]['status'] == 'agreed' and state['submitted'] == []
+
+
+@pytest.mark.parametrize(('text','source'), [('同学说他要重新开始整个登记。','retold'), ('我是否要重启登记？','uncertain')])
+def test_retold_and_uncertain_resumes_do_not_reopen(lab, text, source):
+    model = stop_registration(lab)
+    model.actions = [action('resume_registration','none',text,source)]
+    model.body = '不必办理登记。'
+    assert 'event: done' in lab.post(text,'chen').text
+    assert lab.snap()['registration']['declined_all']
+
+
+def test_uninvited_and_other_contacts_cannot_change_registration(lab):
+    text = '项目经历可以给'
+    choice = action('respond_registration','none',text,field='project_experience',status='agreed')
+    lab.model.actions, lab.model.disclosures, lab.model.body = [choice], [], '我们可以先聊岗位。'
+    assert 'event: done' in lab.post(text,'chen').text
+    assert not lab.snap()['registered']
+    propose(lab)
+    lab.model.actions, lab.model.body = [choice], '我只介绍自己的岗位。'
+    assert 'event: done' in lab.post(text,'lin').text
+    assert all(i['status'] is None for i in lab.snap()['registration']['items'])
+
 
 def test_semantic_adapter_payload_is_role_scoped_and_not_resolved_on_client(lab, monkeypatch):
     import asyncio

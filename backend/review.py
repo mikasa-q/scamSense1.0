@@ -1,9 +1,10 @@
 from sqlalchemy import select
 from .db import Message, Trace
 from .policy import ASKS, FOCI
+from .registration import registration_snapshot
 
 RUBRIC = 'evidence-only-v1'
-CHOICES = {'verify':'先核实再决定', 'leave':'退出招聘流程', 'continue':'继续了解机会'}
+CHOICES = {'verify':'先核实再决定', 'leave':'退出招聘流程', 'continue':'继续了解机会', 'necessary_only':'仅提交必要资料'}
 DIMS = [('risk','风险识别',25), ('verify','主动核实',30), ('decision','决策合理性',25), ('sources','证据分析',20)]
 
 def message_dict(m):
@@ -30,4 +31,8 @@ def make_review(db, sid, ending):
         for m in db.scalars(select(Message).where(Message.sid == sid, Message.id.in_(ending.cited)).order_by(Message.id)):
             groups['decision'].append(dict(role=m.role, speaker=m.speaker, message_id=m.id, focus='decision', topic='决策引用', quote=m.body, why='你在提交决定时引用了这条消息。引用不等同于判断正确。'))
     dimensions = [dict(key=k, label=label, weight=w, score=None, status='pending' if groups[k] else 'insufficient', evidence=groups[k]) for k,label,w in DIMS]
-    return dict(rubric=RUBRIC, total=None, dimensions=dimensions, disclosures=disclosures, ending=ending_dict(ending))
+    registration = registration_snapshot(db, sid)
+    registration['references'] = [dict(role=m.role, speaker=m.speaker, message_id=m.id, focus=t.focus,
+                                       topic='陈浩预登记', quote=t.quote, why=t.why)
+                                  for t, m in rows if m.role == 'chen' and t.kind in {'registration_proposed', 'decline', 'resume_registration'}]
+    return dict(rubric=RUBRIC, total=None, dimensions=dimensions, disclosures=disclosures, ending=ending_dict(ending), registration=registration)
