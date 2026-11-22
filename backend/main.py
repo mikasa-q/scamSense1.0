@@ -105,7 +105,7 @@ def create_app(url=None, model=None):
                     ok = await training.run_turn(factory, model, sid, reservation, data.role, data.text, lambda status:queue.put_nowait(('progress',{'text':status})))
                     queue.put_nowait(('done', {'cached':False}) if ok else ('error', {'detail':'本轮模型调用或事实校验未通过，没有写入对话。可原样重试。'}))
                 except InvalidSubmissionValue:
-                    queue.put_nowait(('error', {'detail':'本轮未写入。请把要提交的每项单独写成「所在城市：虚构城市 B」或「项目经历：虚构项目 A」，不要附加其他值。'}))
+                    queue.put_nowait(('error', {'detail':'本轮没有收取或保存资料。所在城市只接受「虚构城市 B」，项目经历只接受「虚构项目 A」。请检查要提交的完整值，不必改写整句话。'}))
                 except Exception:
                     queue.put_nowait(('error', {'detail':'本轮状态暂不可读，请刷新核实后重试。'}))
             task = asyncio.create_task(work())

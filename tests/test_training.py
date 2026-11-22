@@ -10,7 +10,7 @@ from backend import training
 from backend.db import ROOT, Receipt, StoryEvent, Trace, Training
 from backend.main import create_app
 from backend.model import CompatibleModel
-from backend.policy import Action, Analysis, Audit, ChenAudit, Disclosure, Reply
+from backend.policy import Action, Analysis, Audit, ChenAnalysis, ChenAudit, Disclosure, Reply
 
 ASK = '你亲自核实过这个岗位吗？'
 ANSWER = '我在校园群里看到转发，没亲自核实。'
@@ -35,10 +35,15 @@ class ScriptedModel:
         self.break_at = None
         self.reg = None
         self.received = []
+        self.narrative = []
+        self.audit_narrative = []
+        self.audit_values = {}
         self.calls = []
     async def analyze(self, role, history, text, registration):
         self.calls.append(('analysis',role,history,text))
         if self.break_at == 'analysis': raise RuntimeError()
+        if role == 'chen':
+            return ChenAnalysis(actions=self.actions, narrative_parts=self.narrative)
         return Analysis(actions=self.actions)
     async def reply(self, role, history, text, facts, invite, registration):
         self.calls.append(('reply',role,history,dict(facts),invite))
@@ -48,7 +53,9 @@ class ScriptedModel:
         self.calls.append(('audit',role,history,dict(facts),invite))
         if self.break_at == 'audit': raise RuntimeError()
         evidence = dict(safe=self.safe, supported=list(range(len(actions))) if self.supported is None else self.supported, disclosures=self.disclosures, registration_quote=self.reg)
-        return ChenAudit(**evidence, received_now=self.received) if role == 'chen' else Audit(**evidence, k05=self.k05 if role == 'wang' else None)
+        if role == 'chen':
+            return ChenAudit(**evidence, received_now=self.received, narrative_parts=self.audit_narrative, submitted_values=self.audit_values)
+        return Audit(**evidence, k05=self.k05 if role == 'wang' else None)
 
 @pytest.fixture
 def lab(tmp_path, monkeypatch):
@@ -330,13 +337,15 @@ def propose(lab):
 def test_partial_refusal_actual_submission_and_later_change_of_mind(lab):
     model = propose(lab)
     project, city = '我提交的项目经历：虚构项目 A', '我拒绝提供所在城市'
-    model.actions = [action('respond_registration','none',project,field='project_experience',status='submitted'),
+    model.actions = [action('respond_registration','none',project,field='project_experience',status='submitted',value_quote='虚构项目 A'),
                      action('respond_registration','none',city,field='city',status='refused')]
+    model.audit_values = {0:'虚构项目 A'}
     model.body = '收到了虚构项目 A，城市不必提供。'
     assert 'event: done' in lab.post(project+'，'+city,'chen').text
     r = lab.snap()['registration']
     assert [i['status'] for i in r['items']] == ['submitted','refused'] and r['submitted'] == ['project_experience']
     last = '项目经历之后先不提供。'
+    model.audit_values = {}
     model.actions = [action('respond_registration','none',last,field='project_experience',status='deferred')]
     model.body = '可以，不需要继续给项目资料。'
     assert 'event: done' in lab.post(last,'chen').text
@@ -351,7 +360,10 @@ def test_partial_refusal_actual_submission_and_later_change_of_mind(lab):
 ])
 def test_same_turn_corrections_follow_the_source_not_candidate_order(lab, first, first_status, last, last_status, submitted):
     model = propose(lab)
-    earlier = action('respond_registration', 'none', first, field='city', status=first_status)
+    value = '虚构城市 B' if first_status == 'submitted' else None
+    earlier = action('respond_registration', 'none', first, field='city', status=first_status, value_quote=value)
+    model.audit_values = {0:value} if value else {}
+    model.narrative = model.audit_narrative = [{'part_id':1, 'predicate':'算'}] if value else []
     later = action('respond_registration', 'none', last, field='city', status=last_status)
     model.actions, model.body = [later, earlier, earlier], '明白，按你最后说的办。'
     text, rid = first + '。算了，' + last, str(uuid4())
@@ -412,8 +424,9 @@ def test_only_explicit_audited_reopening_overrides_whole_decline(lab, previous_i
 def test_unverified_item_changes_never_commit(lab, failure):
     model = propose(lab)
     text = {'intent_only':'我可以提供项目经历', 'other_fields_value':'项目经历：虚构城市 B'}.get(failure,'项目经历：虚构项目 A')
-    model.actions = [action('respond_registration','none',text,field='project_experience',status='submitted')]
-    model.body = '我收到了项目经历。'
+    evidence = '虚构城市 B' if failure == 'other_fields_value' else '虚构项目 A'
+    model.actions = [action('respond_registration','none',text,field='project_experience',status='submitted',value_quote=evidence)]
+    model.audit_values, model.body = {0:evidence}, '我收到了项目经历。'
     if failure == 'unsupported': model.supported = []
     if failure == 'unsafe': model.safe = False
     before = lab.snap()
@@ -432,24 +445,141 @@ def test_unverified_item_changes_never_commit(lab, failure):
     ('city', '所在城市：', '虚构城市 B（也填杭州）', '虚构城市 B'),
     ('project_experience', '我提交的项目经历：', '虚构项目 A1', '虚构项目 A'),
     ('project_experience', '项目经历：', '虚构项目 A 和另一个项目', '虚构项目 A 和另一个项目'),
+    ('project_experience', '项目经历：', '虚构项目 A、另一段实习', '项目经历：虚构项目 A'),
+    ('project_experience', '项目经历：', '虚构项目 A，图书馆排班系统', '项目经历：虚构项目 A'),
+    ('city', '所在城市：', '「虚构城市 B，杭州」', '所在城市：「虚构城市 B'),
+    ('city', '所在城市：', '「杭州、虚构城市 B」', '虚构城市 B'),
+    ('city', '所在城市：', '「 虚构城市 B 」', '虚构城市 B'),
+    ('city', '所在城市：', '虚构城市 Ｂ', '所在城市：虚构城市 Ｂ'),
+    ('project_experience', '项目经历：', '虚构项目  A', '项目经历：虚构项目  A'),
 ])
 def test_mixed_or_truncated_value_rolls_back_entire_turn(lab, field, prefix, value, quote):
     model = propose(lab)
     other = '项目经历可以给' if field == 'city' else '所在城市可以给'
     other_field = 'project_experience' if field == 'city' else 'city'
+    clipped = '虚构城市 B' if field == 'city' else '虚构项目 A'
     model.actions = [action('respond_registration', 'none', other, field=other_field, status='agreed'),
-                     action('respond_registration', 'none', quote, field=field, status='submitted')]
+                     action('respond_registration', 'none', quote, field=field, status='submitted', value_quote=clipped)]
+    model.audit_values = {1:clipped}
     model.body, model.received = '本轮资料已收到。', [field]
     before = lab.snap()
     assert 'event: error' in lab.post(other+'；'+prefix+value, 'chen').text
     assert lab.snap() == before
 
 
+@pytest.mark.parametrize(('text', 'quote', 'field', 'value', 'link', 'narration'), [
+    ('陈老师好，我这次登记的所在城市是虚构城市 B，谢谢。', '我这次登记的所在城市是虚构城市 B', 'city', '虚构城市 B', '是', ('好', '谢谢')),
+    ('刚下课才看到消息。就拿虚构项目 A作为我这回登记的项目经历吧。麻烦您了。',
+     '就拿虚构项目 A作为我这回登记的项目经历吧', 'project_experience', '虚构项目 A', '作为', ('看到', '麻烦')),
+    ('今天在杭州上课，登记这栏我填的城市是「虚构城市 B」，辛苦您核对。',
+     '登记这栏我填的城市是「虚构城市 B」', 'city', '虚构城市 B', '是', ('上课', '核对')),
+], ids=['address-and-thanks', 'value-before-field', 'unrelated-city-in-narrative'])
+def test_audited_submission_checks_the_value_not_surrounding_prose(lab, text, quote, field, value, link, narration):
+    model = propose(lab)
+    model.actions = [action('respond_registration','none',quote,field=field,status='submitted',value_quote=value,field_link=link)]
+    model.narrative = model.audit_narrative = [{'part_id':i, 'predicate':p} for i,p in zip((0,2), narration)]
+    model.audit_values = {0:value}
+    model.body, model.received = '收到这项虚构资料了。', [field]
+    assert 'event: done' in lab.post(text, 'chen').text
+    state = lab.snap()
+    entry, = state['registration']['history']
+    assert state['registration']['submitted'] == [field]
+    assert (entry['field'],entry['quote'],entry['position']) == (field,quote,text.index(quote))
+    assert state['messages'][-2]['body'] == text and state['messages'][-1]['body'] == model.body
+
+
+@pytest.mark.parametrize(('text', 'source'), [
+    ('陈老师，下午好！', None), ('城市那栏是填「虚构城市 B」吗？', 'uncertain'),
+    ('我只是在引用同学的原话：「我提交的项目经历：虚构项目 A」。', 'retold'),
+], ids=['just-a-greeting', 'question', 'quotation'])
+def test_non_submitting_speech_can_continue_after_invitation(lab, text, source):
+    model = propose(lab)
+    field, value = ('city', '虚构城市 B') if source == 'uncertain' else ('project_experience', '虚构项目 A')
+    model.actions = [action('respond_registration', 'none', text, source, field=field, status='submitted', value_quote=value)] if source else []
+    model.body, model.received = '我们可以继续聊。', []
+    assert 'event: done' in lab.post(text, 'chen').text
+    snap = lab.snap()
+    assert snap['registration']['history'] == snap['registration']['submitted'] == []
+    assert snap['messages'][-1]['body'] == model.body
+
+
+@pytest.mark.parametrize(('quote','evidence'), [
+    ('所在城市：虚构城市 B', None), ('所在城市：虚构城市 B', '杭州'),
+    ('所在城市：虚构城市 B', '虚构项目 A'), ('所在城市：虚构城市 B', '虚构城市'),
+], ids=['missing','not-in-source','other-field','incomplete'])
+def test_actual_value_evidence_is_required_even_if_the_auditor_agrees(lab, quote, evidence):
+    model = propose(lab)
+    model.actions = [action('respond_registration','none',quote,field='city',status='submitted',value_quote=evidence)]
+    model.body, model.received = '本次已收到所在城市。', ['city']
+    model.audit_values = {0:'虚构城市 B'}
+    before = lab.snap()
+    assert 'event: error' in lab.post(quote, 'chen').text
+    assert lab.snap() == before
+
+
+@pytest.mark.parametrize(('text','field','value'), [
+    ('项目经历：虚构城市 B', 'city', '虚构城市 B'),
+    ('我的所在城市是虚构项目 A', 'project_experience', '虚构项目 A'),
+    ('项目经历：另一段经历；所在城市：虚构项目 A', 'project_experience', '虚构项目 A'),
+], ids=['wrong-slot', 'wrong-slot-without-colon', 'other-clause'])
+def test_an_exact_value_cannot_be_borrowed_from_another_field(lab, text, field, value):
+    model = propose(lab)
+    model.actions = [action('respond_registration','none',text,field=field,status='submitted',value_quote=value,field_link='是' if '是' in text else None)]
+    model.audit_values, model.received, model.body = {0:value}, [field], '本次收到了。'
+    before = lab.snap()
+    assert 'event: error' in lab.post(text, 'chen').text and lab.snap() == before
+
+
+@pytest.mark.parametrize(('narrative','values'), [
+    ([], {0:'虚构城市 B'}), ([{'part_id':1, 'predicate':'没说过'}], {0:'虚构城市 B'}),
+    ([{'part_id':1, 'predicate':'再聊'}], {}), ([{'part_id':1, 'predicate':'再聊'}], {0:'虚构项目 A'}),
+], ids=['unaccounted-clause', 'invented-prose', 'missing-value', 'wrong-value'])
+def test_audit_needs_independent_source_evidence_not_just_supported(lab, narrative, values):
+    model = propose(lab)
+    quote = '所在城市：虚构城市 B'
+    model.actions = [action('respond_registration','none',quote,field='city',status='submitted',value_quote='虚构城市 B')]
+    model.narrative = [{'part_id':1, 'predicate':'再聊'}]
+    model.audit_narrative, model.audit_values = narrative, values
+    model.received, model.body = ['city'], '本次收到了。'
+    before = lab.snap()
+    result = lab.post(quote+'，我们明天再聊。', 'chen').text
+    assert result.count('event: progress') == 3 and 'event: error' in result and lab.snap() == before
+
+
+@pytest.mark.parametrize(('field','label','value','extra','predicate'), [
+    ('city', '所在城市', '虚构城市 B', '杭州', '杭州'),
+    ('city', '所在城市', '虚构城市 B', '杭州', '杭'),
+    ('project_experience', '项目经历', '虚构项目 A', '图书馆排班系统', '图书馆排班系统'),
+    ('project_experience', '项目经历', '虚构项目 A', '图书馆排班系统', '排班'),
+], ids=['city-as-prose', 'half-a-city-as-predicate', 'project-as-prose', 'word-inside-project-name'])
+def test_a_bare_competing_value_cannot_be_discarded_as_narrative(lab, field, label, value, extra, predicate):
+    model = propose(lab)
+    quote = label + '：' + value
+    model.actions = [action('respond_registration','none',quote,field=field,status='submitted',value_quote=value)]
+    model.narrative = model.audit_narrative = [{'part_id':1, 'predicate':predicate}]
+    model.audit_values, model.received, model.body = {0:value}, [field], '这一项收到了。'
+    before = lab.snap()
+    assert 'event: error' in lab.post(quote+'，'+extra, 'chen').text and lab.snap() == before
+
+
+def test_vocative_and_independent_item_with_natural_prose(lab):
+    model = propose(lab)
+    city, project = '这次我给城市填的是虚构城市 B', '眼下暂时不打算提供项目经历'
+    model.actions = [action('respond_registration','none',city,field='city',status='submitted',value_quote='虚构城市 B',field_link='是'),
+                     action('respond_registration','none',project,field='project_experience',status='deferred')]
+    model.narrative = model.audit_narrative = [{'part_id':0}, {'part_id':3, 'predicate':'再见'}]
+    model.audit_values, model.received, model.body = {0:'虚构城市 B'}, ['city'], '本次只收到了所在城市。'
+    assert 'event: done' in lab.post(f'陈老师，{city}，{project}。再见。', 'chen').text
+    reg = lab.snap()['registration']
+    assert reg['submitted'] == ['city'] and [e['quote'] for e in reg['history']] == [city, project]
+
+
 def test_two_exact_values_with_separate_clauses_can_be_submitted(lab):
     model = propose(lab)
     project, city = '这次我提交项目经历：虚构项目 A', '我的所在城市是「虚构城市 B」'
-    model.actions = [action('respond_registration', 'none', city, field='city', status='submitted'),
-                     action('respond_registration', 'none', project, field='project_experience', status='submitted')]
+    model.actions = [action('respond_registration', 'none', city, field='city', status='submitted', value_quote='虚构城市 B', field_link='是'),
+                     action('respond_registration', 'none', project, field='project_experience', status='submitted', value_quote='虚构项目 A')]
+    model.audit_values = {0:'虚构项目 A', 1:'虚构城市 B'}
     model.body, model.received = '收到这两项虚构资料。', ['project_experience', 'city']
     assert 'event: done' in lab.post(project+'；'+city+'。', 'chen').text
     r = lab.snap()['registration']
@@ -469,9 +599,10 @@ def stop_registration(lab):
 def test_same_turn_resume_only_authorizes_later_items(lab, support_resume):
     model = stop_registration(lab)
     early, resume, late = '我提交的项目经历：虚构项目 A', '我明确重新开始整个登记', '我现在提交所在城市：虚构城市 B'
-    model.actions = [action('respond_registration','none',late,field='city',status='submitted'),
+    model.actions = [action('respond_registration','none',late,field='city',status='submitted',value_quote='虚构城市 B'),
                      action('resume_registration','none',resume),
-                     action('respond_registration','none',early,field='project_experience',status='submitted')]
+                     action('respond_registration','none',early,field='project_experience',status='submitted',value_quote='虚构项目 A')]
+    model.audit_values = {2:'虚构城市 B'}
     model.body, model.received = '已恢复，这次只收到了虚构城市 B。', ['city']
     model.supported = [0,1,2] if support_resume else [0,2]
     before = lab.snap()
@@ -488,7 +619,7 @@ def test_same_turn_resume_only_authorizes_later_items(lab, support_resume):
 def test_same_turn_stop_blocks_later_field_and_false_receipt_is_not_saved(lab):
     model = propose(lab)
     stop, field = '不再参与整个登记', '我提交的项目经历：虚构项目 A'
-    model.actions = [action('respond_registration', 'none', field, field='project_experience', status='submitted'), action('decline', 'none', stop)]
+    model.actions = [action('respond_registration', 'none', field, field='project_experience', status='submitted', value_quote='虚构项目 A'), action('decline', 'none', stop)]
     model.body, model.received = '已停止，不过已收到项目经历。', ['project_experience']
     before = lab.snap()
     assert 'event: error' in lab.post(stop+'。'+field, 'chen').text and lab.snap() == before
@@ -501,7 +632,7 @@ def test_same_turn_stop_blocks_later_field_and_false_receipt_is_not_saved(lab):
 def test_future_promise_with_exact_placeholder_is_not_a_submission(lab):
     model = propose(lab)
     text = '以后我会给虚构项目 A'
-    model.actions = [action('respond_registration','none',text,field='project_experience',status='submitted')]
+    model.actions = [action('respond_registration','none',text,field='project_experience',status='submitted',value_quote='虚构项目 A',field_link='给')]
     model.supported, model.body = [], '收到项目资料了。'
     before = lab.snap()
     assert 'event: error' in lab.post(text,'chen').text and lab.snap() == before

@@ -62,13 +62,14 @@ def scopes(monkeypatch):
         data = json.loads(data); reg = data['registration']; calls.append((system, reg))
         pending = reg.get('legacy_declines', [])
         if system == CHEN_INTERPRET:
-            result = {'actions':[dict(kind='respond_registration', focus='none', quote=PROJECT, source='own', field='project_experience', status='submitted')]}
+            result = {'actions':[dict(kind='respond_registration', focus='none', quote=PROJECT, source='own', field='project_experience', status='submitted', value_quote='虚构项目 A')]}
         elif system == CHEN_GENERATE:
             result = {'body':'本次收到虚构项目 A。' if reg['this_turn'] else '本次没有收取资料。'}
         else:
             assert system == CHEN_AUDIT
             result = {'safe':True, 'supported':[0], 'registration_quote':None, 'disclosures':[],
-                      'received_now':['project_experience'] if reg['this_turn'] else []}
+                      'received_now':['project_experience'] if reg['this_turn'] else [],
+                      'submitted_values':{'0':'虚构项目 A'} if reg['this_turn'] else {}}
         if system in votes and votes[system] is not None:
             result['legacy_scopes'] = {str(p['id']):votes[system] for p in pending}
         return httpx.Response(200, request=httpx.Request('POST', url), json={'choices':[{'message':{'content':json.dumps(result)}}]})

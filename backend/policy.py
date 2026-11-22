@@ -3,7 +3,7 @@ import re
 import unicodedata
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from .registration import FIELDS, FieldKey, Status
 
@@ -21,13 +21,21 @@ class Action(BaseModel):
     field: FieldKey | None = None
     status: Status | None = None
     position: int | None = Field(default=None, ge=0, lt=600)
+    value_quote: str | None = Field(default=None, min_length=1, max_length=600)
+    field_link: str | None = Field(default=None, min_length=1, max_length=600)
 
 class Analysis(BaseModel):
     actions: list[Action] = Field(max_length=10)
 
 LegacyScope = Literal['city_only', 'project_only', 'city_later', 'project_later', 'items_only', 'whole', 'uncertain']
 
+class ProseEvidence(BaseModel):
+    part_id: StrictInt = Field(ge=0, lt=600)
+    predicate: str | None = Field(default=None, min_length=1, max_length=600)
+
+
 class ChenAnalysis(Analysis):
+    narrative_parts: list[ProseEvidence] = Field(default_factory=list, max_length=300)
     legacy_scopes: dict[int, LegacyScope] = Field(default_factory=dict)
 
 class Reply(BaseModel):
@@ -51,6 +59,8 @@ class Audit(BaseModel):
 
 class ChenAudit(Audit):
     received_now: list[FieldKey] = Field(max_length=2)
+    narrative_parts: list[ProseEvidence] = Field(default_factory=list, max_length=300)
+    submitted_values: dict[int, str] = Field(default_factory=dict, max_length=10)
     legacy_scopes: dict[int, LegacyScope] = Field(default_factory=dict)
 
 SCENE = '虚构校园求职场景：一则初级 Python 后端开发实习机会在校园求职群里转发。人物、企业和岗位均为虚构。'
@@ -116,6 +126,8 @@ def validate_actions(analysis, body, role, registered):
                 continue
         elif a.field or a.status:
             continue
+        if a.status != 'submitted' and (a.value_quote is not None or a.field_link is not None):
+            a = a.model_copy(update={'value_quote':None, 'field_link':None})
         pos = body.index(a.quote)
         if a.kind in REGISTRATION_ACTIONS:
             if a.position is not None:
@@ -126,12 +138,13 @@ def validate_actions(analysis, body, role, registered):
                 raise ValueError('ambiguous registration quote position')
             a = a.model_copy(update={'position': pos})
         key = (a.kind, a.focus, a.field, a.position if a.kind in REGISTRATION_ACTIONS else None)
+        evidence = (a.status, a.value_quote, a.field_link)
         if key in seen:
-            if seen[key] != a.status:
+            if seen[key] != evidence:
                 raise ValueError('conflicting registration choices at the same position')
             continue
         result.append((pos, a))
-        seen[key] = a.status
+        seen[key] = evidence
     if role != 'chen':
         return [a for _, a in result]
     ordered = [a for _, a in sorted(result, key=lambda item: item[0])]
@@ -154,44 +167,120 @@ class InvalidSubmissionValue(ValueError):
 
 
 CLAUSE_MARKS = '，,。.!！?？;；\n'
+QUOTES = {'「':'」', '『':'』', '“':'”', '‘':'’', '"':'"', "'":"'"}
+FIELD_NOUN = {'city':'城市', 'project_experience':'项目'}
+LIST_EDGE = re.compile(r'(?:[、/／|｜+＋&＆或和与及]|以及)\s*$')
 
 
-def check_submission_values(text, actions, submissions):
-    # Validate the full source clauses, not just the excerpts the model selected.
-    clauses = list(re.finditer(rf'[^{re.escape(CLAUSE_MARKS)}]+', text))
-    checked = set()
+def registration_parts(text):
+    # A comma inside a quoted value or a parenthesis cannot start independent prose.
+    pairs = {**QUOTES, '（':'）', '(':')', '[':']', '【':'】'}
+    stack, parts, start = [], [], 0
+    for i, ch in enumerate(text):
+        if stack and ch == stack[-1]:
+            stack.pop()
+        elif ch in pairs:
+            stack.append(pairs[ch])
+        elif not stack and ch in CLAUSE_MARKS:
+            if text[start:i].strip():
+                parts.append((start, text[start:i]))
+            start = i + 1
+    if text[start:].strip():
+        parts.append((start, text[start:]))
+    return parts
+
+
+def check_value_slot(a, part, i):
+    raw = part[i:i + len(a.value_quote)]
+    if raw != a.value_quote or raw != FIELDS[a.field]['placeholder']:
+        raise InvalidSubmissionValue()
+    before, after = part[:i], part[i + len(raw):]
+    if re.match(r'[a-zA-Z0-9_]', after):
+        raise InvalidSubmissionValue()
+    left, right = before.rstrip(), after.lstrip()
+    opener = left[-1:]
+    if opener in QUOTES:
+        if not before.endswith(opener) or not after.startswith(QUOTES[opener]):
+            raise InvalidSubmissionValue()
+        left, right = left[:-1].rstrip(), right[1:].lstrip()
+
+    # The field can bind on either side. An unquoted word boundary needs verbatim binding evidence.
+    link = a.field_link
+    if link and (not link.isalpha() or LIST_EDGE.search(link)):
+        raise InvalidSubmissionValue()
+    cited_left, _, cited_right = a.quote.partition(raw)
+    if right:
+        binder = cited_right.removeprefix(QUOTES.get(opener, '')).lstrip()
+        if not (link and right.startswith(link) and binder.startswith(link) and FIELD_NOUN[a.field] in binder[len(link):]
+                and FIELD_NOUN[a.field] not in left):
+            raise InvalidSubmissionValue()
+        binding = right[len(link):]
+    else:
+        binding = left
+        binder = cited_left.rstrip().removesuffix(opener if opener in QUOTES else '').rstrip()
+        if left and not (left.endswith(('：', ':', '=', FIELDS[a.field]['label'], FIELD_NOUN[a.field]))
+                         or (link and left.endswith(link) and binder.endswith(link))):
+            raise InvalidSubmissionValue()
+    slot_prefix = left.rsplit(FIELD_NOUN[a.field], 1)[-1]
+    if LIST_EDGE.search(left) or re.search(r'[：:=]\s*\S', slot_prefix):
+        raise InvalidSubmissionValue()
+    owners = [(binding.index(noun) if right else len(binding) - binding.rindex(noun) - len(noun), key)
+              for key, noun in FIELD_NOUN.items() if noun in binding]
+    if owners and min(owners)[1] != a.field:
+        raise InvalidSubmissionValue()
+
+
+def check_submission_values(text, actions, submissions, narrative):
+    parts = registration_parts(text)
+    covered = set()
     for a in submissions:
-        value = FIELDS[a.field]['placeholder']
-        if value not in a.quote:
+        if not a.value_quote or a.quote.count(a.value_quote) != 1:
             raise InvalidSubmissionValue()
-        pos = a.position + a.quote.index(value)
-        clause = next(c for c in clauses if c.start() <= pos < c.end())
-        label = '(?:所在)?城市' if a.field == 'city' else '项目(?:经历)?'
-        prefix = rf'(?:这次|现在|本次)?(?:我|本人)?(?:这次|现在|本次)?(?:提交|提供|填写|登记|给出)?的?(?:{label})?(?:填写|提交|填|为|是)?\s*[：:=]?\s*'
-        literal = re.escape(value)
-        if not re.fullmatch(prefix + rf'(?:{literal}|「{literal}」|“{literal}”|"{literal}")', clause.group().strip()):
+        pos = a.position + a.quote.index(a.value_quote)
+        for n, (start, part) in enumerate(parts):
+            if start <= pos < start + len(part):
+                check_value_slot(a, part, pos - start)
+                covered.add(n)
+                break
+        else:
             raise InvalidSubmissionValue()
-        if a.quote.strip(CLAUSE_MARKS + ' \t') not in clause.group():
-            raise InvalidSubmissionValue()
-        checked.add(clause.start())
 
-    # A separator may introduce another choice, but must never hide an extra data value.
-    other_clauses = set()
+    value_parts = covered.copy()
+    # A clipped quote, or even an entire multi-clause quote, cannot account for a neighbouring value.
     for a in actions:
         if a in submissions:
             continue
         start = a.position if a.position is not None else text.index(a.quote)
         content = a.quote.strip(CLAUSE_MARKS + ' \t')
-        other_clauses.add((start + a.quote.index(content), content))
-    for clause in clauses:
-        content = clause.group().strip()
-        if clause.start() in checked or not content or content in {'算了', '不过', '另外', '谢谢'}:
+        origin = start + a.quote.index(content)
+        covered.update(n for n, (offset, p) in enumerate(parts)
+                       if p.strip() == content and offset + p.index(content) == origin)
+    if sorted(e.part_id for e in narrative) != [n for n in range(len(parts)) if n not in covered]:
+        raise InvalidSubmissionValue()
+    predicates = {e.part_id:e.predicate for e in narrative}
+    after_value, previous_end = False, 0
+    for n, (offset, fragment) in enumerate(parts):
+        if text[previous_end:offset].strip('，, \t'):
+            after_value = False
+        previous_end = offset + len(fragment)
+        if n in covered:
+            after_value = n in value_parts
             continue
-        if (clause.start() + clause.group().index(content), content) not in other_clauses:
+        prose, predicate = fragment.strip(), predicates[n]
+        if predicate is not None and (not predicate.strip() or predicate not in prose):
             raise InvalidSubmissionValue()
+        if re.match(r'(?:所在城市|城市|项目(?:经历)?)\s*[：:=]', prose):
+            raise InvalidSubmissionValue()
+        if after_value:
+            # In a comma list, neither a bare name nor a word clipped out of a compound proves a new clause.
+            half = len(prose) // 2
+            repeated = half > 0 and prose[:half] * 2 == prose
+            framed = predicate and predicate != prose and len(prose) > 2 and (prose.startswith(predicate) or prose.endswith(predicate))
+            if not predicate or not (repeated or framed):
+                raise InvalidSubmissionValue()
 
 
-def registration_turn(state, actions, text):
+def registration_turn(state, actions, text, narrative):
     if state is None:
         return None
     paused, pending = state['declined_all'], state.get('scope_pending', False)
@@ -209,7 +298,7 @@ def registration_turn(state, actions, text):
         effective.append(a)
     submissions = [a for a in effective if a.status == 'submitted']
     if submissions:
-        check_submission_values(text, actions, submissions)
+        check_submission_values(text, actions, submissions, narrative)
     return RegistrationTurn(stopped_after=paused, allow_invitation=invite, this_turn=effective)
 
 

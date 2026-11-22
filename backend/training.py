@@ -142,7 +142,7 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
             for row in pending:
                 apply_legacy_refusal(registration['items'], LEGACY_TRACE_KIND.get(legacy_scopes[row['id']]),
                                      row['quote'], row['message_id'])
-        plan = registration_turn(registration, actions, text)
+        plan = registration_turn(registration, actions, text, analysis.narrative_parts if registration else [])
         facts, invite = permission(role, actions, previous, plan)
         context = {**registration, **plan.model_dump(exclude={'allow_invitation'}, exclude_none=True)} if plan else None
         progress('联系人正在组织回复')
@@ -154,10 +154,14 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
         if plan is not None:
             if audit.legacy_scopes != legacy_scopes:
                 raise ValueError('legacy refusal scope not independently confirmed')
-            audited = registration_turn(registration, valid, text)
+            audited = registration_turn(registration, valid, text, audit.narrative_parts)
             if audited != plan:
                 raise ValueError('audited registration differs from the context used to generate the reply')
-            submitted = {a.field for a in audited.this_turn if a.status == 'submitted'}
+            expected_values = {i:a.value_quote for i, a in enumerate(actions) if a.status == 'submitted' and a in audited.this_turn}
+            if audit.submitted_values != expected_values or (expected_values and
+                    {e.part_id for e in analysis.narrative_parts} != {e.part_id for e in audit.narrative_parts}):
+                raise InvalidSubmissionValue()
+            submitted = {actions[i].field for i in expected_values}
             if set(audit.received_now) - submitted:
                 raise ValueError('reply acknowledges an unauthorized submission')
             valid = [a for a in valid if a.kind not in REGISTRATION_ACTIONS or a in audited.this_turn]
