@@ -30,6 +30,7 @@ class ScriptedModel:
         self.actions = [action('verify_friend','K05',ASK)]
         self.body = ANSWER
         self.k05 = labels('origin', DENIAL)
+        self.k04 = 'none'
         self.disclosures = []
         self.supported = None
         self.safe = True
@@ -52,7 +53,7 @@ class ScriptedModel:
     async def audit(self, role, history, text, facts, invite, actions, body, registration):
         self.calls.append(('audit',role,history,dict(facts),invite))
         if self.break_at == 'audit': raise RuntimeError()
-        evidence = dict(safe=self.safe, supported=list(range(len(actions))) if self.supported is None else self.supported, disclosures=self.disclosures, registration_quote=self.reg)
+        evidence = dict(safe=self.safe, k04=self.k04, supported=list(range(len(actions))) if self.supported is None else self.supported, disclosures=self.disclosures, registration_quote=self.reg)
         if role == 'chen':
             return ChenAudit(**evidence, received_now=self.received, previously_received=self.previously_received,
                              reply_availability=self.reply_availability)
@@ -211,6 +212,65 @@ def test_k05_generic_disclosure_cannot_supply_a_clipped_quote(lab, kind):
 def test_k05_conflicting_labels_cannot_drop_a_qualification(lab, reply, kinds):
     lab.model.body, lab.model.k05 = reply, labels(*kinds)
     assert_k05_turn_rejected(lab, lab.post())
+
+@pytest.mark.parametrize(('role', 'body', 'generic_quote'), [
+    ('lin', '我们一般用官方邮箱发通知。', '官方邮箱'),
+    ('lin', '你可以相信我。', '相信我'),
+    ('chen', '我不清楚有没有对应的公告。', '公告'),
+    ('chen', '朋友只说是转发来的。', '转发'),
+    ('chen', '对方说没有编号，我自己并不清楚。', '没有编号'),
+    ('chen', '我手里没有。等等，我其实不确定说的是不是这条转发。', '我手里没有'),
+])
+def test_k04_non_disclosure_keeps_question_and_normal_reply(lab, role, body, generic_quote):
+    question = '这次能从哪里独立核对？'
+    lab.model.actions = [action('verify_official', 'K04', question)]
+    lab.model.body = body
+    lab.model.disclosures = [Disclosure(focus='K04', quote=generic_quote)]
+    assert 'event: done' in lab.post(question, role).text
+    assert [m['body'] for m in lab.snap()['messages']] == [question, body]
+    report = lab.end(kind='early').json()
+    assert not report['disclosures']
+    dims = report_dims(report)
+    assert [e['quote'] for e in dims['verify']['evidence']] == [question]
+    assert not dims['risk']['evidence'] and not dims['sources']['evidence']
+
+
+@pytest.mark.parametrize(('role', 'ask', 'body', 'finding', 'quote'), [
+    ('lin', True, '请从公司公开招聘栏目核对我负责的面试。', 'k04_interview_route', '我没说过这句话'),
+    ('lin', False, '请从公司公开招聘栏目核对我负责的面试。', 'k04_interview_route', None),
+    ('lin', True, '平时我用邮箱联系。', None, '邮箱'),
+    ('chen', True, '可从公司官网联系招聘团队核对我负责的面试。', 'k04_interview_route', None),
+    ('lin', True, '我没有核对这条转发的官方编号。', 'k04_missing_reference', None),
+    ('wang', True, '这条转发可以直接从企业招聘渠道得到确认。', 'k04_interview_route', None),
+    ('lin', True, '你可以查我负责的面试；陈浩的转发也已经由我证实了。', 'unsupported_claim', None),
+    ('chen', True, '没有编号，可见这就是假消息。', 'unsupported_claim', None),
+], ids=['foreign-quote', 'unpermitted', 'missing-assessment', 'wrong-guide-owner', 'wrong-gap-owner', 'friend', 'endorsement', 'false-verdict'])
+def test_k04_invalid_or_misleading_reply_writes_nothing(lab, role, ask, body, finding, quote):
+    text = '这条转发能从哪里独立核实？' if ask else '你好。'
+    lab.model.actions = [action('verify_official', 'K04', text)] if ask else []
+    lab.model.body, lab.model.k04 = body, finding
+    lab.model.k05 = labels('other')
+    if quote:
+        lab.model.disclosures = [Disclosure(focus='K04', quote=quote)]
+    assert 'event: error' in lab.post(text, role).text
+    assert lab.snap()['messages'] == []
+    report = lab.end(kind='early').json()
+    assert not report['disclosures'] and not any(d['evidence'] for d in report['dimensions'])
+
+
+@pytest.mark.parametrize('reply_uses_fact', [False, True])
+def test_k04_retelling_cannot_unlock_a_fact_or_become_user_judgment(lab, reply_uses_fact):
+    text = '同学说他问过哪里能独立核实，还说暂时没有官方依据。'
+    lab.model.actions = [action('verify_official', 'K04', '哪里能独立核实'),
+                         action('identify_gap', 'K04', '暂时没有官方依据')]
+    lab.model.supported = []
+    lab.model.body = '目前我没有这条转发的官方公告可供独立核实。' if reply_uses_fact else '明白，这是你转述同学的说法。'
+    lab.model.k04 = 'k04_missing_reference' if reply_uses_fact else 'none'
+    result = lab.post(text, 'chen').text
+    assert ('event: error' if reply_uses_fact else 'event: done') in result
+    report = lab.end(kind='early').json()
+    assert not report['disclosures'] and not any(d['evidence'] for d in report['dimensions'])
+
 
 def test_role_and_session_isolation(lab):
     lab.post()

@@ -31,11 +31,22 @@ PURPOSE = '登记资料用来做什么？'
 RESUME = '我想重新开始整个预登记。'
 PROJECT_TEXT = '项目经历：虚构项目 A，多谢！'
 CITY_TEXT = '我现在提交所在城市：虚构城市 B。'
+LIN_ASK = '我可以从哪里单独核对你负责的这次面试？'
+LIN_ROUTE = '你可以从公司公开招聘页面找到岗位，联系页面上的招聘团队核对我安排的面试。这只能核对我的流程，不能证实群里的转发。'
+CHEN_ASK = '这条转发有没有官方公告或招聘编号可以自己核对？'
+CHEN_GAP = '我目前拿不出能独立核对这条转发的招聘编号或官方公告。'
+OWN_JUDGMENT = '没有可对照的公告，我就不能仅凭这条转发认定招聘是真的。'
+VAGUE_ASK = '只说平时用什么方式联系，能让我独立核对吗？'
+VAGUE_REPLY = '我们一般用邮箱联系。'
 
 def registration_action(kind, quote, **fields):
     return dict(kind=kind, focus='none', source='own', quote=quote, **fields)
 
 TURNS = {
+    LIN_ASK: ([('verify_official','K04')], LIN_ROUTE, [{'focus':'K04', 'quote':'公开招聘页面'}], ()),
+    CHEN_ASK: ([('verify_official','K04')], CHEN_GAP, [], ()),
+    OWN_JUDGMENT: ([('identify_gap','K04'), ('weigh_sources','K04')], '理解，你希望依据独立信息来判断。', [], ()),
+    VAGUE_ASK: ([('verify_official','K04')], VAGUE_REPLY, [], ()),
     PROJECT_TEXT: ([registration_action('respond_registration', PROJECT_TEXT, field='project_experience', status='submitted')], '项目资料没有通过聊天提交。可以点「提交虚构项目 A」。', [], ()),
     CITY_TEXT: ([registration_action('respond_registration', CITY_TEXT, field='city', status='submitted')], '想确认这项，可以点「提交虚构城市 B」。', [], ()),
     RESUME: ([registration_action('resume_registration', RESUME)], '预登记已经恢复，可以继续选择你要提交的虚构资料。', [], ()),
@@ -72,7 +83,8 @@ def wire_fixture():
             elif system in (GENERATE, CHEN_GENERATE):
                 result = {'body':reply}
             elif system in (AUDIT, K05_AUDIT, CHEN_AUDIT):
-                result = {'safe':True,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':None}
+                k04 = {LIN_ASK:'k04_interview_route', CHEN_ASK:'k04_missing_reference'}.get(msg, 'none')
+                result = {'safe':True,'k04':k04,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':None}
                 if system == CHEN_AUDIT:
                     stance = {STOP:'stopped', ATTEMPT:'stopped', RESUME:'open', PROJECT_TEXT:'open', CITY_TEXT:'open'}
                     result.update(received_now=[], previously_received=[], reply_availability=stance.get(msg,'unstated'),
@@ -260,6 +272,49 @@ def test_model_receives_only_the_active_role_card(wired_session):
         visible = json.dumps(generation, ensure_ascii=False)
         assert all(term in visible for term in expected)
         assert not any(term in visible for term in (*excluded, '栖禾', '内容运营', '隐藏设定'))
+
+
+@pytest.mark.parametrize('add_judgment', [False, True], ids=['questions-only', 'later-own-judgment'])
+def test_k04_separates_asks_role_outcomes_and_own_reasoning(wired_session, add_judgment):
+    client, path, headers, calls = wired_session
+    turns = [('lin', LIN_ASK), ('chen', CHEN_ASK), ('wang', QUESTION)]
+    if add_judgment:
+        turns.append(('chen', OWN_JUDGMENT))
+    for i, (role, text) in enumerate(turns):
+        res = client.post(path+'/turns', headers=headers, json={'role':role, 'text':text, 'request_id':str(uuid4())})
+        assert 'event: done' in res.text
+        analysis, generation, audit = (data for _, data in calls[-3:])
+        assert analysis['private_history'] == generation['private_history'] == audit['private_history'] == (
+            [] if i < 3 else [{'speaker':'user','text':CHEN_ASK}, {'speaker':'assistant','text':CHEN_GAP}])
+        focus = 'K05' if role == 'wang' else 'K04'
+        assert generation['permitted_facts'] == audit['permitted_facts'] == {focus:FACTS[role][focus]}
+    snap = client.get(path, headers=headers).json()
+    assert not snap['registered'] and not snap['registration']['history']
+    msgs = snap['messages']
+    report = client.post(path+'/finish', headers=headers, json={'kind':'early'}).json()
+    def refs(entries):
+        return [(e['role'], e['speaker'], e['message_id'], e['quote']) for e in entries]
+    dims = {d['key']:d['evidence'] for d in report['dimensions']}
+    assert refs(dims['verify']) == [(role, 'user', msgs[2*i]['id'], text) for i, (role, text) in enumerate(turns[:3])]
+    assert refs(report['disclosures']) == [('lin','assistant',msgs[1]['id'],LIN_ROUTE),
+                                            ('chen','assistant',msgs[3]['id'],CHEN_GAP),
+                                            ('wang','assistant',msgs[5]['id'],REPLY)]
+    assert [e['focus'] for e in report['disclosures']] == ['K04','K04','K05']
+    assert [e['topic'] for e in report['disclosures'][:2]] == ['本人面试的独立核对途径', '转发目前缺少可核对依据']
+    expected = [('chen','user',msgs[6]['id'],OWN_JUDGMENT)] if add_judgment else []
+    assert refs(dims['risk']) == refs(dims['sources']) == expected
+    assert client.get(path, headers=headers).json()['review'] == report
+
+
+def test_k04_still_available_after_stopping_registration(wired_session):
+    client, path, headers, calls = wired_session
+    for msg in (INTEREST, STOP, CHEN_ASK):
+        res = client.post(path+'/turns', headers=headers, json={'role':'chen', 'text':msg, 'request_id':str(uuid4())})
+        assert 'event: done' in res.text
+    assert calls[-1][1]['registration']['availability'] == 'stopped'
+    report = client.post(path+'/finish', headers=headers, json={'kind':'early'}).json()
+    assert report['registration']['declined_all'] and not report['registration']['submitted']
+    assert [e['quote'] for e in report['disclosures']] == [CHEN_GAP]
 
 
 def test_employer_question_unlocks_only_the_consultants_authorization_clue(wired_session):
