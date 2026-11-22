@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {ArrowRight, CornerDownLeft, Flag, Quote} from 'lucide-vue-next'
-import {roles, scene, statusText, submittedLabels, type Report, type RefQuote} from '../data'
+import {dateText, roles, scene, statusText, submittedLabels, type Report, type RefQuote} from '../data'
 const props=defineProps<{report:Report;sid:string}>()
 const link=(ref:RefQuote)=>`#/chat/${props.sid}/${ref.role}?m=${ref.message_id}`
 </script>
@@ -9,9 +9,12 @@ const link=(ref:RefQuote)=>`#/chat/${props.sid}/${ref.role}?m=${ref.message_id}`
     <h3>已提交项：{{submittedLabels(report.registration)}}</h3><p class="muted">同意提供、重启登记和终局决定都不算实际提交。</p>
     <p v-if="report.registration.declined_all">已停止整个登记。之前实际提交的记录仍然保留。</p>
     <p v-else-if="report.registration.scope_pending">旧会话留有拒绝原话，但无法确认当时是否停止了整个登记。</p>
-    <p v-for="i in report.registration.items" :key="i.key">{{i.label}} · {{i.status ? statusText[i.status] : '未表态'}}</p>
+    <p v-for="i in report.registration.items" :key="i.key">{{i.label}}最近聊天表态：{{i.status ? statusText[i.status] : '未表态'}}</p>
     <article v-for="e in report.registration.references" :key="`${e.message_id}-${e.quote}`" class="ref-entry"><small>{{e.speaker==='user'?'你':'陈浩'}} · {{e.why}}</small><blockquote>{{e.quote}}</blockquote><a :href="link(e)">定位原话 <CornerDownLeft :size="13"/></a></article>
-    <article v-for="(e,i) in report.registration.history" :key="i" class="ref-entry"><small>你 · {{report.registration.items.find(item=>item.key===e.field)?.label}} · {{statusText[e.status]}}</small><blockquote>{{e.quote}}</blockquote><a :href="`#/chat/${sid}/chen?m=${e.message_id}`">定位你的原话</a> · <a :href="`#/chat/${sid}/chen?m=${e.reply_id}`">查看陈浩当时的回复</a></article>
+    <article v-for="(e,i) in report.registration.history" :key="i" class="ref-entry">
+      <template v-if="e.source==='explicit'"><small>显式确认 · {{dateText(e.created)}}</small><p>通过按钮提交：{{e.value}}</p></template>
+      <template v-else><small>{{e.status==='submitted'?'旧版聊天提交':'聊天表态'}} · {{report.registration.items.find(item=>item.key===e.field)?.label}} · {{statusText[e.status]}}</small><blockquote>{{e.quote}}</blockquote><a :href="`#/chat/${sid}/chen?m=${e.message_id}`">定位你的原话</a> · <a :href="`#/chat/${sid}/chen?m=${e.reply_id}`">查看陈浩当时的回复</a></template>
+    </article>
   </div></section>
   <section class="desk-section"><header class="section-head"><div><div class="eyebrow">01 &nbsp;/&nbsp; BEHAVIOR</div><h2>你的行为证据</h2></div></header><div class="dimension-grid"><article v-for="d in report.dimensions" :key="d.key" class="dimension panel"><div class="dimension-title"><h3>{{d.label}}</h3><span>{{d.weight}}%</span></div><p class="dim-status">{{d.score!==null?d.score+' 分':d.status==='insufficient'?'证据不足':'已找到依据 · 待定标'}}</p><div v-for="(e,i) in d.evidence" :key="i" class="ref-entry"><small>{{roles[e.role].name}}私聊 · {{e.speaker==='user'?'你':roles[e.role].name}}</small><blockquote>{{e.quote}}</blockquote><p>{{e.why}}</p><a :href="link(e)">定位原话 <CornerDownLeft :size="13"/></a></div><p v-if="!d.evidence.length" class="muted">没有足够原文支持这一维度，不记为 0 分。</p></article></div></section>
   <section class="desk-section"><header class="section-head"><div><div class="eyebrow">02 &nbsp;/&nbsp; DISCLOSURES</div><h2>角色实际透露了什么</h2></div></header><div class="panel clues"><p class="muted" v-if="!report.disclosures.length">本场没有可引用的角色线索。获准谈论某件事，不代表角色已经说出。</p><article v-for="(e,i) in report.disclosures" :key="i" class="ref-entry"><small>{{e.focus}} / {{e.topic}} · {{roles[e.role].name}}</small><blockquote>{{e.quote}}</blockquote><p>{{e.why}}</p><a :href="link(e)">定位原话 <CornerDownLeft :size="13"/></a></article></div></section><div class="report-end"><a :href="`#/chat/${sid}/wang`" class="btn light">回看全部私聊</a><a href="#/desk" class="btn primary">回到工作台 <ArrowRight :size="15"/></a></div></template>

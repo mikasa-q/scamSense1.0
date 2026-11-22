@@ -28,24 +28,22 @@ MIXED = '项目经历可以给，所在城市先不提供'
 STOP = '我停止整个预登记。'
 ATTEMPT = '我提交的项目经历：虚构项目 A'
 PURPOSE = '登记资料用来做什么？'
-CITY = '虚构城市 B'
-CITY_STATEMENT = '我这次登记的所在城市是' + CITY
-POLITE_CITY = f'陈老师好，{CITY_STATEMENT}，谢谢。'
-MIXED_CITY = f'陈老师好，{CITY_STATEMENT}、杭州，谢谢。'
-COMMA_CITY = f'陈老师好，{CITY_STATEMENT}，杭州，谢谢。'
+RESUME = '我想重新开始整个预登记。'
+PROJECT_TEXT = '项目经历：虚构项目 A，多谢！'
+CITY_TEXT = '我现在提交所在城市：虚构城市 B。'
 
 def registration_action(kind, quote, **fields):
     return dict(kind=kind, focus='none', source='own', quote=quote, **fields)
 
 TURNS = {
-    **{s: ([registration_action('respond_registration', CITY_STATEMENT, field='city', status='submitted',
-                                 value_quote=CITY, field_link='是')], '本次已收到所在城市。', [], ())
-       for s in (POLITE_CITY, MIXED_CITY, COMMA_CITY)},
+    PROJECT_TEXT: ([registration_action('respond_registration', PROJECT_TEXT, field='project_experience', status='submitted')], '项目资料没有通过聊天提交。可以点「提交虚构项目 A」。', [], ()),
+    CITY_TEXT: ([registration_action('respond_registration', CITY_TEXT, field='city', status='submitted')], '想确认这项，可以点「提交虚构城市 B」。', [], ()),
+    RESUME: ([registration_action('resume_registration', RESUME)], '预登记已经恢复，可以继续选择你要提交的虚构资料。', [], ()),
     INTEREST: ([registration_action('interest', INTEREST, opportunity='chen')], INVITE, [], ()),
     MIXED: ([registration_action('respond_registration', '项目经历可以给', field='project_experience', status='agreed'),
              registration_action('respond_registration', '所在城市先不提供', field='city', status='deferred')], '项目经历只是愿意提供，城市暂缓。两项都还没有提交。', [], ()),
     STOP: ([registration_action('decline', STOP)], '好的，预登记已停止，可以继续聊岗位。', [], ()),
-    ATTEMPT: ([registration_action('respond_registration', ATTEMPT, field='project_experience', status='submitted', value_quote='虚构项目 A')], '预登记仍已停止，本次没有收下项目资料。', [], ()),
+    ATTEMPT: ([registration_action('respond_registration', ATTEMPT, field='project_experience', status='submitted')], '预登记仍已停止，本次没有收下项目资料。', [], ()),
     PURPOSE: ([('ask_data', 'K02')], '原本说是用来汇总意向和安排面试。', [], ()),
     HELLO: ([], '你好，有什么想了解的？', [], ('other','other')),
     QUESTION: ([('verify_friend','K05')], REPLY, [], ('self_denies_job_check','origin')),
@@ -76,16 +74,13 @@ def wire_fixture():
             elif system in (AUDIT, K05_AUDIT, CHEN_AUDIT):
                 result = {'safe':True,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':None}
                 if system == CHEN_AUDIT:
-                    result.update(received_now=[], registration_quote=reply if msg == INTEREST else None)
+                    stance = {STOP:'stopped', ATTEMPT:'stopped', RESUME:'open', PROJECT_TEXT:'open', CITY_TEXT:'open'}
+                    result.update(received_now=[], previously_received=[], reply_availability=stance.get(msg,'unstated'),
+                                  registration_quote=reply if msg == INTEREST else None)
                 if system == K05_AUDIT:
                     result['k05'] = [{'part_id':i, 'kind':kind} for i, kind in enumerate(kinds)]
             else:
                 self.send_error(400); return
-            if msg in (POLITE_CITY, MIXED_CITY, COMMA_CITY):
-                if system in (CHEN_INTERPRET, CHEN_AUDIT):
-                    result['narrative_parts'] = [{'part_id':0, 'predicate':'好'}, {'part_id':3 if msg == COMMA_CITY else 2, 'predicate':'谢谢'}]
-                if system == CHEN_AUDIT:
-                    result.update(received_now=['city'], submitted_values={'0':CITY})
             body = json.dumps({'choices':[{'message':{'role':'assistant','content':json.dumps(result,ensure_ascii=False)}}]},ensure_ascii=False).encode()
             self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
     with ThreadingHTTPServer(('127.0.0.1',0),Handler) as server:
@@ -172,7 +167,7 @@ def test_stopped_registration_blocks_a_supported_submission_and_keeps_k05_privat
     generation, audit = (data for _,data in calls[-2:])
     assert audit['candidates'][0]['status'] == 'submitted'  # The independent stub even supports it.
     assert audit['registration'] == generation['registration']
-    assert generation['registration']['stopped_after'] and generation['registration']['this_turn'] == []
+    assert generation['registration']['availability'] == 'stopped' and generation['registration']['this_turn'] == []
     assert not generation['allow_invitation']
     count = len(calls)
     assert '"cached":true' in send('chen', ATTEMPT, rid).text and len(calls) == count
@@ -197,28 +192,41 @@ def test_stopped_registration_blocks_a_supported_submission_and_keeps_k05_privat
         assert not next(d for d in report['dimensions'] if d['key'] == 'risk')['evidence']
 
 
-def test_city_value_is_taken_from_this_turn_not_the_model_or_a_polite_frame(wired_session):
+def test_only_confirmations_write_through_stop_and_restart(wired_session):
     client, path, headers, calls = wired_session
     def send(text):
-        return client.post(path+'/turns', headers=headers, json={'role':'chen', 'text':text, 'request_id':str(uuid4())}).text
-    assert 'event: done' in send(INTEREST)
-    before = client.get(path, headers=headers).json()
-    for mixed in (MIXED_CITY, COMMA_CITY):
+        res = client.post(path+'/turns', headers=headers, json={'role':'chen', 'text':text, 'request_id':str(uuid4())})
+        assert 'event: done' in res.text
+        return client.get(path, headers=headers).json()
+    def confirm(option):
         count = len(calls)
-        result = send(mixed)
-        assert 'event: error' in result and '本次已收到所在城市' not in result
-        assert [p for p, _ in calls[count:]] == [CHEN_INTERPRET]
-        assert client.get(path, headers=headers).json() == before
-    assert 'event: done' in send(POLITE_CITY)
-    analysis, generation, audit = [data for _, data in calls[-3:]]
-    assert analysis['source_parts'] == audit['source_parts'] == [
-        {'part_id':0, 'text':'陈老师好'}, {'part_id':1, 'text':CITY_STATEMENT}, {'part_id':2, 'text':'谢谢'}]
-    assert 'narrative_parts' not in audit and generation['current_user'] == audit['current_user'] == POLITE_CITY
-    candidate, = audit['candidates']
-    assert (candidate['field'], candidate['value_quote'], candidate['position']) == ('city', CITY, POLITE_CITY.index(CITY_STATEMENT))
-    state = client.get(path, headers=headers).json()['registration']
-    entry, = state['history']
-    assert state['submitted'] == ['city'] and entry['quote'] == CITY_STATEMENT
+        res = client.post(path+'/contacts/chen/registration/confirm', headers=headers, json={'option_id':option})
+        assert len(calls) == count
+        return res
+    send(INTEREST)
+    assert send(PROJECT_TEXT)['registration']['history'] == []
+    assert calls[-1][1]['candidates'][0]['status'] == 'submitted' and not calls[-1][1]['registration']['this_turn']
+    assert confirm('project_a').json()['registration']['submitted'] == ['project_experience']
+    snap = send(STOP)
+    assert confirm('city_b').status_code == 409 and client.get(path, headers=headers).json() == snap
+    snap = send(RESUME)
+    assert snap['registered'] and not snap['registration']['declined_all'] and len(snap['registration']['history']) == 1
+    for _, payload in calls[-2:]:
+        assert payload['registration']['availability'] == 'open' and not payload['allow_invitation']
+        assert 'declined_all' not in payload['registration'] and payload['registration']['submitted'] == ['project_experience']
+    assert send(CITY_TEXT)['registration'] == snap['registration']
+    confirmed = confirm('city_b').json()
+    assert confirmed['registration']['submitted'] == ['project_experience','city']
+    for role in ['lin','wang']:
+        result = client.post(path+'/turns', headers=headers, json={'role':role,'text':HELLO,'request_id':str(uuid4())})
+        assert 'event: done' in result.text
+        for _, data in calls[-3:]:
+            assert 'registration' not in data and data['private_history'] == [] and '虚构项目 A' not in str(data)
+    with TestClient(create_app()) as fresh:
+        assert fresh.get(path, headers=headers).json()['registration'] == confirmed['registration']
+        report = fresh.post(path+'/finish', headers=headers, json={'kind':'decision','choice':'necessary_only'}).json()
+        assert report['registration']['history'] == confirmed['registration']['history']
+        assert [ref['quote'] for ref in report['registration']['references']] == [INVITE, STOP, RESUME]
 
 
 def test_model_receives_only_the_active_role_card(wired_session):

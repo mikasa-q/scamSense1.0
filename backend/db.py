@@ -98,6 +98,17 @@ class RegistrationEntry(Base):
     status: Mapped[str] = mapped_column(String(12))
     quote: Mapped[str] = mapped_column(Text)
 
+class RegistrationConfirmation(Base):
+    __tablename__ = 'registration_confirmations'
+    __table_args__ = (UniqueConstraint('sid', 'field', name='uq_confirmation_field'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sid: Mapped[str] = mapped_column(ForeignKey('trainings.id'))
+    field: Mapped[str] = mapped_column(String(24))
+    value: Mapped[str] = mapped_column(String(24))
+    created: Mapped[str] = mapped_column(String, default=now)
+    # Orders clicks between real chat turns; this is not a message authored by the user.
+    after_message_id: Mapped[int] = mapped_column(ForeignKey('messages.id'))
+
 class Ending(Base):
     __tablename__ = 'endings'
     sid: Mapped[str] = mapped_column(ForeignKey('trainings.id'), primary_key=True)

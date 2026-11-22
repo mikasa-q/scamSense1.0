@@ -2,25 +2,38 @@ from typing import Literal
 
 from sqlalchemy import select
 
-from .db import Message, RegistrationEntry, StoryEvent, Trace
+from .db import Message, RegistrationConfirmation, RegistrationEntry, StoryEvent, Trace
 
 FieldKey = Literal['project_experience', 'city']
 Status = Literal['agreed', 'submitted', 'deferred', 'refused']
+CHAT_STATUSES = {'agreed', 'deferred', 'refused'}
+OptionId = Literal['project_a', 'city_b']
+Availability = Literal['not_invited', 'open', 'stopped', 'scope_pending']
 LEGACY_ITEMS = {'legacy_city_refusal': ('city', 'refused'), 'legacy_project_refusal': ('project_experience', 'refused'),
                 'legacy_city_deferred': ('city', 'deferred'), 'legacy_project_deferred': ('project_experience', 'deferred')}
 LEGACY_TRACE_KIND = {'items_only': 'legacy_item_decline', 'whole': 'decline',
                      'city_only': 'legacy_city_refusal', 'project_only': 'legacy_project_refusal',
                      'city_later': 'legacy_city_deferred', 'project_later': 'legacy_project_deferred'}
 FIELDS = {
-    'project_experience': {'label': '项目经历', 'placeholder': '虚构项目 A'},
-    'city': {'label': '所在城市', 'placeholder': '虚构城市 B'},
+    'project_experience': {'option_id': 'project_a', 'label': '项目经历', 'placeholder': '虚构项目 A'},
+    'city': {'option_id': 'city_b', 'label': '所在城市', 'placeholder': '虚构城市 B'},
 }
+OPTIONS = {spec['option_id']: key for key, spec in FIELDS.items()}
 
 
 def was_invited(db, sid):
-    return db.scalar(select(StoryEvent.id).where(
-        StoryEvent.sid == sid, StoryEvent.kind == 'registration_proposed'
+    return db.scalar(select(StoryEvent.id).join(Message, Message.id == StoryEvent.message_id).where(
+        StoryEvent.sid == sid, StoryEvent.kind == 'registration_proposed',
+        Message.sid == sid, Message.role == 'chen', Message.speaker == 'assistant',
     ).limit(1)) is not None
+
+
+def availability(invited, stopped, pending) -> Availability:
+    if stopped:
+        return 'stopped'
+    if pending:
+        return 'scope_pending'
+    return 'open' if invited else 'not_invited'
 
 
 def registration_controls(db, sid):
@@ -39,12 +52,15 @@ def registration_controls(db, sid):
 
 
 def registration_log(db, sid):
-    rows = db.execute(select(RegistrationEntry, Message.body)
-                      .join(Message, Message.id == RegistrationEntry.reply_id)
-                      .where(RegistrationEntry.sid == sid)
-                      .order_by(RegistrationEntry.message_id, RegistrationEntry.position, RegistrationEntry.id))
-    return [dict(field=e.field, status=e.status, quote=e.quote, position=e.position, message_id=e.message_id,
-                 reply_id=e.reply_id, reply_quote=body) for e, body in rows]
+    rows = db.execute(select(RegistrationEntry, Message.body).join(Message, Message.id == RegistrationEntry.reply_id)
+                      .where(RegistrationEntry.sid == sid))
+    ordered = [((e.message_id, 0, e.position, e.id),
+                dict(source='chat', field=e.field, status=e.status, quote=e.quote, position=e.position,
+                     message_id=e.message_id, reply_id=e.reply_id, reply_quote=body)) for e, body in rows]
+    for c in db.scalars(select(RegistrationConfirmation).where(RegistrationConfirmation.sid == sid)):
+        ordered.append(((c.after_message_id, 1, 0, c.id),
+                        dict(source='explicit', field=c.field, status='submitted', value=c.value, created=c.created)))
+    return [entry for _, entry in sorted(ordered, key=lambda pair: pair[0])]
 
 
 def registration_snapshot(db, sid):
@@ -67,7 +83,8 @@ def registration_state(db, sid, entries):
     submitted = set()
     for e in entries:
         key = e['field']
-        items[key].update(status=e['status'], quote=e['quote'], message_id=e['message_id'])
+        if e['source'] == 'chat':
+            items[key].update(status=e['status'], quote=e['quote'], message_id=e['message_id'])
         # A later change of mind cannot undo an earlier transmission.
         if e['status'] == 'submitted':
             submitted.add(key)

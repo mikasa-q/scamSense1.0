@@ -3,10 +3,10 @@ import secrets
 import time
 from fastapi import HTTPException
 from sqlalchemy import select
-from .db import Ending, Message, Receipt, RegistrationEntry, Review, StoryEvent, Trace, Training, uid, writer
-from .policy import ASKS, REGISTRATION_ACTIONS, WHY, InvalidSubmissionValue, check_generated, permission, registration_turn, validate_actions, validate_reply
-from .registration import LEGACY_TRACE_KIND, apply_legacy_refusal, registration_controls, registration_log, registration_snapshot, registration_state, was_invited
-from .review import RUBRIC, make_review, message_dict
+from .db import Ending, Message, Receipt, RegistrationConfirmation, RegistrationEntry, Review, StoryEvent, Trace, Training, uid, writer
+from .policy import ASKS, REGISTRATION_ACTIONS, WHY, check_generated, permission, registration_turn, validate_actions, validate_registration_reply, validate_reply
+from .registration import CHAT_STATUSES, FIELDS, LEGACY_TRACE_KIND, OPTIONS, apply_legacy_refusal, availability, registration_controls, registration_log, registration_snapshot, registration_state, was_invited
+from .review import RUBRIC, make_review, message_dict, saved_review
 
 
 def digest(value):
@@ -21,11 +21,39 @@ def create(factory):
         db.add(StoryEvent(sid=s.id, kind='created', stage=0))
         return dict(id=s.id, token=token, created=s.created)
 
+def require_owner(db, sid, token):
+    s = db.get(Training, sid)
+    if not s or not secrets.compare_digest(s.token_hash, digest(token)):
+        raise HTTPException(404, '本场训练不存在，或当前浏览器没有访问凭据。')
+    return s
+
 def check_access(factory, sid, token):
     with factory() as db:
-        s = db.get(Training, sid)
-        if not s or not secrets.compare_digest(s.token_hash, digest(token)):
-            raise HTTPException(404, '本场训练不存在，或当前浏览器没有访问凭据。')
+        require_owner(db, sid, token)
+
+def confirm_registration(factory, sid, token, role, option_id):
+    with writer(factory) as db:
+        s = require_owner(db, sid, token)
+        if role != 'chen':
+            raise HTTPException(403, '只有陈浩的私聊开放虚构预登记。')
+        if option_id not in OPTIONS:
+            raise HTTPException(422, '请选择已开放的虚构资料。')
+        if s.closed or is_busy(s):
+            raise HTTPException(409, '训练已结束或有发言正在处理，请刷新查看。')
+        stopped, pending = registration_controls(db, sid)
+        gate = availability(was_invited(db, sid), stopped, pending)
+        if gate != 'open':
+            raise HTTPException(409, {'stopped':'整个登记已停止。', 'scope_pending':'旧拒绝范围尚待确认。',
+                                      'not_invited':'陈浩尚未发出登记邀请。'}[gate])
+        field = OPTIONS[option_id]
+        legacy = select(RegistrationEntry.id).where(RegistrationEntry.sid == sid, RegistrationEntry.field == field,
+                                                    RegistrationEntry.status == 'submitted').limit(1)
+        confirmed = select(RegistrationConfirmation.id).where(RegistrationConfirmation.sid == sid,
+                                                              RegistrationConfirmation.field == field)
+        if db.scalar(confirmed) is not None or db.scalar(legacy) is not None:
+            return
+        anchor = db.scalar(select(Message.id).where(Message.sid == sid, Message.role == 'chen').order_by(Message.id.desc()).limit(1))
+        db.add(RegistrationConfirmation(sid=sid, field=field, value=FIELDS[field]['placeholder'], after_message_id=anchor))
 
 def is_busy(s):
     return bool(s.locked_by and s.lock_until > time.time())
@@ -37,7 +65,7 @@ def snapshot(factory, sid):
         review = db.get(Review, sid)
         return dict(id=s.id, created=s.created, stage=s.stage, closed=s.closed, busy=is_busy(s),
                     registered=was_invited(db, sid), registration=registration_snapshot(db, sid),
-                    messages=[message_dict(m) for m in messages], review=review.payload if review else None)
+                    messages=[message_dict(m) for m in messages], review=saved_review(review))
 
 def reserve(factory, sid, request_id, role, text, configured):
     fingerprint = digest(role + '\0' + text)
@@ -103,6 +131,8 @@ def store_turn(factory, sid, rid, attempt, role, text, body, actions, disclosed,
                 record_event(db, s, kind, stage, user.id)
                 emitted.add(kind)
             if a.kind == 'respond_registration':
+                if a.status not in CHAT_STATUSES:
+                    raise ValueError('chat can only record willingness')
                 db.add(RegistrationEntry(sid=sid, message_id=user.id, reply_id=reply.id,
                                          field=a.field, status=a.status, quote=a.quote, position=a.position))
             if a.kind in WHY:
@@ -142,9 +172,18 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
             for row in pending:
                 apply_legacy_refusal(registration['items'], LEGACY_TRACE_KIND.get(legacy_scopes[row['id']]),
                                      row['quote'], row['message_id'])
-        plan = registration_turn(registration, actions, text, analysis.narrative_parts if registration else [])
+        plan = registration_turn(registration, actions)
         facts, invite = permission(role, actions, previous, plan)
-        context = {**registration, **plan.model_dump(exclude={'allow_invitation'}, exclude_none=True)} if plan else None
+        context = None
+        if plan:
+            items = {i['key']: dict(i) for i in registration['items']}
+            for a in plan.this_turn:
+                if a.kind == 'respond_registration':
+                    items[a.field].update(status=a.status, quote=a.quote, message_id=None)
+            context = dict(items=list(items.values()), submitted=registration['submitted'],
+                           **plan.model_dump(exclude={'allow_invitation'}, exclude_none=True))
+            if pending := registration.get('legacy_declines'):
+                context['legacy_declines'] = pending
         progress('联系人正在组织回复')
         reply = await model.reply(role, history, text, facts, invite, context)
         check_generated(reply.body)
@@ -154,23 +193,15 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
         if plan is not None:
             if audit.legacy_scopes != legacy_scopes:
                 raise ValueError('legacy refusal scope not independently confirmed')
-            audited = registration_turn(registration, valid, text, audit.narrative_parts)
+            audited = registration_turn(registration, valid)
             if audited != plan:
                 raise ValueError('audited registration differs from the context used to generate the reply')
-            expected_values = {i:a.value_quote for i, a in enumerate(actions) if a.status == 'submitted' and a in audited.this_turn}
-            if audit.submitted_values != expected_values or (expected_values and
-                    {e.part_id for e in analysis.narrative_parts} != {e.part_id for e in audit.narrative_parts}):
-                raise InvalidSubmissionValue()
-            submitted = {actions[i].field for i in expected_values}
-            if set(audit.received_now) - submitted:
-                raise ValueError('reply acknowledges an unauthorized submission')
+            validate_registration_reply(audit, audited, reg, registration['submitted'])
             valid = [a for a in valid if a.kind not in REGISTRATION_ACTIONS or a in audited.this_turn]
         store_turn(factory, sid, rid, attempt, role, text, body, valid, disclosed, reg, registered, legacy_scopes)
         return True
-    except Exception as exc:
+    except Exception:
         fail_turn(factory, sid, rid, attempt)
-        if isinstance(exc, InvalidSubmissionValue):
-            raise
         return False
 
 def finish(factory, sid, kind, choice, reason, cited):
@@ -179,7 +210,7 @@ def finish(factory, sid, kind, choice, reason, cited):
         if s.closed:
             old = db.get(Ending, sid)
             if (old.kind, old.choice, old.reason, old.cited) == (kind, choice, reason, cited):
-                return db.get(Review, sid).payload
+                return saved_review(db.get(Review, sid))
             raise HTTPException(409, '本场已经结束，原决定未被更改。')
         if is_busy(s):
             raise HTTPException(409, '请等当前发言处理结束，再提交终局。')

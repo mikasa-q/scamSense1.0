@@ -15,7 +15,12 @@ from sqlalchemy.orm import sessionmaker
 from . import training
 from .db import ROOT, database_url, engine_for
 from .model import CompatibleModel
-from .policy import InvalidSubmissionValue, Role, sensitive
+from .policy import Role, sensitive
+from .registration import OptionId
+
+class ConfirmationInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    option_id: OptionId
 
 class TurnInput(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
@@ -76,11 +81,19 @@ def create_app(url=None, model=None):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         return response
 
-    def owned(sid: str, authorization: Annotated[str | None, Header()] = None):
+    def bearer(authorization: Annotated[str | None, Header()] = None):
         token = (authorization or '').removeprefix('Bearer ')
         if not authorization or token == authorization:
             raise HTTPException(401, '需要本场训练的访问凭据。')
+        return token
+
+    def owned(sid: str, token: Annotated[str, Depends(bearer)]):
         training.check_access(factory, sid, token)
+
+    @app.post('/api/sessions/{sid}/contacts/{role}/registration/confirm')
+    def confirm(sid: str, role: Role, data: ConfirmationInput, token: Annotated[str, Depends(bearer)]):
+        training.confirm_registration(factory, sid, token, role, data.option_id)
+        return training.snapshot(factory, sid)
 
     @app.get('/api/health')
     def health():
@@ -104,8 +117,6 @@ def create_app(url=None, model=None):
                 try:
                     ok = await training.run_turn(factory, model, sid, reservation, data.role, data.text, lambda status:queue.put_nowait(('progress',{'text':status})))
                     queue.put_nowait(('done', {'cached':False}) if ok else ('error', {'detail':'本轮模型调用或事实校验未通过，没有写入对话。可原样重试。'}))
-                except InvalidSubmissionValue:
-                    queue.put_nowait(('error', {'detail':'本轮没有收取或保存资料。所在城市只接受「虚构城市 B」，项目经历只接受「虚构项目 A」。请检查要提交的完整值，不必改写整句话。'}))
                 except Exception:
                     queue.put_nowait(('error', {'detail':'本轮状态暂不可读，请刷新核实后重试。'}))
             task = asyncio.create_task(work())

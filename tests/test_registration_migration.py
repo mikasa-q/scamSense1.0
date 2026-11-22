@@ -10,7 +10,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from backend import training
-from backend.db import ROOT, Message, Receipt, Review, StoryEvent, Trace, engine_for
+from backend.db import ROOT, Message, Receipt, RegistrationEntry, Review, StoryEvent, Trace, engine_for
 from backend.main import create_app
 from backend.model import CHEN_AUDIT, CHEN_GENERATE, CHEN_INTERPRET
 
@@ -62,14 +62,13 @@ def scopes(monkeypatch):
         data = json.loads(data); reg = data['registration']; calls.append((system, reg))
         pending = reg.get('legacy_declines', [])
         if system == CHEN_INTERPRET:
-            result = {'actions':[dict(kind='respond_registration', focus='none', quote=PROJECT, source='own', field='project_experience', status='submitted', value_quote='虚构项目 A')]}
+            result = {'actions':[dict(kind='respond_registration', focus='none', quote=PROJECT, source='own', field='project_experience', status='submitted')]}
         elif system == CHEN_GENERATE:
-            result = {'body':'本次收到虚构项目 A。' if reg['this_turn'] else '本次没有收取资料。'}
+            result = {'body':'本次聊天没有收取资料。'}
         else:
             assert system == CHEN_AUDIT
             result = {'safe':True, 'supported':[0], 'registration_quote':None, 'disclosures':[],
-                      'received_now':['project_experience'] if reg['this_turn'] else [],
-                      'submitted_values':{'0':'虚构项目 A'} if reg['this_turn'] else {}}
+                      'received_now':[], 'previously_received':[], 'reply_availability':'unstated'}
         if system in votes and votes[system] is not None:
             result['legacy_scopes'] = {str(p['id']):votes[system] for p in pending}
         return httpx.Response(200, request=httpx.Request('POST', url), json={'choices':[{'message':{'content':json.dumps(result)}}]})
@@ -77,7 +76,11 @@ def scopes(monkeypatch):
     return votes, calls
 
 
-def submit(client, path, headers):
+def confirm(client, path, headers, option='project_a'):
+    return client.post(path+'/contacts/chen/registration/confirm', headers=headers, json={'option_id':option})
+
+
+def chat(client, path, headers):
     return client.post(path+'/turns', headers=headers, json={'text':PROJECT, 'role':'chen', 'request_id':str(uuid4())}).text
 
 
@@ -93,7 +96,9 @@ def test_upgrade_keeps_the_correct_gate_on_actual_project_submission(upgraded_se
     with TestClient(create_app()) as client:
         before = client.get(path, headers=headers).json()['registration']
         assert not before['scope_pending'] and before['declined_all'] is stopped
-        assert 'event: done' in submit(client, path, headers)
+        assert 'event: done' in chat(client, path, headers)
+        assert not client.get(path, headers=headers).json()['registration']['submitted']
+        assert confirm(client, path, headers).status_code == (409 if stopped else 200)
         state = client.get(path, headers=headers).json()['registration']
         assert state['submitted'] == ([] if stopped else ['project_experience'])
         assert state['declined_all'] is stopped
@@ -119,12 +124,15 @@ def test_free_form_legacy_scope_must_be_resolved_from_original_message(upgraded_
     votes.update({CHEN_INTERPRET:scope, CHEN_AUDIT:scope})
     with TestClient(create_app()) as client:
         assert client.get(path, headers=headers).json()['registration']['scope_pending']
-        assert 'event: done' in submit(client, path, headers)
+        assert confirm(client, path, headers).status_code == 409 and not calls
+        assert 'event: done' in chat(client, path, headers)
         assert [prompt for prompt, _ in calls] == [CHEN_INTERPRET, CHEN_GENERATE, CHEN_AUDIT]
         for _, context in calls:
             old, = context['legacy_declines']
             assert old['message'] == body and old['quote'] == quote
     with TestClient(create_app()) as fresh:
+        assert not fresh.get(path, headers=headers).json()['registration']['submitted']
+        assert confirm(fresh, path, headers).status_code == (200 if accepted else 409)
         reg = fresh.get(path, headers=headers).json()['registration']
         assert reg['submitted'] == (['project_experience'] if accepted else [])
         assert reg['declined_all'] is (scope == 'whole') and reg['scope_pending'] is (scope == 'uncertain')
@@ -141,11 +149,82 @@ def test_legacy_scope_disagreement_or_missing_vote_keeps_original_evidence(upgra
     with TestClient(create_app()) as client:
         before = client.get(path, headers=headers).json()
         votes[CHEN_AUDIT] = audit_vote
-        assert 'event: error' in submit(client, path, headers)
+        assert 'event: error' in chat(client, path, headers)
         assert client.get(path, headers=headers).json() == before
         votes[CHEN_AUDIT] = 'items_only'
-        assert 'event: done' in submit(client, path, headers)
-        assert client.get(path, headers=headers).json()['registration']['submitted'] == ['project_experience']
+        assert 'event: done' in chat(client, path, headers)
+        assert not client.get(path, headers=headers).json()['registration']['submitted']
+        assert confirm(client, path, headers).json()['registration']['submitted'] == ['project_experience']
+
+
+def test_upgrade_keeps_chat_submissions_distinct_from_clicks(tmp_path, monkeypatch):
+    url = f'sqlite:///{(tmp_path / "pr3.db").as_posix()}'
+    monkeypatch.setenv('SCAMSENSE_DATABASE_URL',url)
+    config = Config(str(ROOT / 'alembic.ini'))
+    command.upgrade(config, '0003_legacy_decline_scope')
+    engine = engine_for(url)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    s = seed_old_session(factory, [])
+    with factory.begin() as db:
+        receipt = Receipt(sid=s['id'], request_id=str(uuid4()), fingerprint='old', attempt='old', status='done')
+        db.add(receipt); db.flush()
+        user, reply = [Message(sid=s['id'], receipt=receipt.id, role='chen', speaker=speaker, body=body)
+                       for speaker,body in [('user',PROJECT), ('assistant','收到了虚构项目 A。')]]
+        db.add_all([user, reply]); db.flush()
+        db.add(RegistrationEntry(sid=s['id'], message_id=user.id, reply_id=reply.id, position=0,
+                                 field='project_experience', status='submitted', quote=PROJECT))
+    command.upgrade(config, 'head')
+    path, headers = '/api/sessions/'+s['id'], {'Authorization':'Bearer '+s['token']}
+    with TestClient(create_app()) as client:
+        snap = client.get(path, headers=headers).json()
+        old, = snap['registration']['history']
+        assert (old['source'],old['status'],old['message_id'],old['reply_id'],old['quote'],old['reply_quote']) == (
+            'chat','submitted',user.id,reply.id,user.body,reply.body)
+        assert confirm(client,path,headers).json() == snap  # Already submitted under the old contract.
+        updated = confirm(client,path,headers,'city_b').json()
+        assert updated['messages'] == snap['messages']
+        prior, click = updated['registration']['history']
+        assert prior == old and (click['source'], click['field'], click['value']) == ('explicit','city','虚构城市 B')
+        assert 'quote' not in click and 'reply_id' not in click
+        report = client.post(path+'/finish',headers=headers,json={'kind':'early'}).json()
+        assert report['registration']['history'] == [old,click]
+        assert client.get(path,headers=headers).json()['review'] == report
+    with engine.connect() as conn:
+        assert conn.execute(text('PRAGMA foreign_key_check')).all() == []
+    engine.dispose()
+
+
+def test_pre_confirmation_review_is_labeled_without_rewriting_its_payload(tmp_path, monkeypatch):
+    from backend.db import Ending, Training
+    url = f'sqlite:///{(tmp_path / "archived.db").as_posix()}'
+    monkeypatch.setenv('SCAMSENSE_DATABASE_URL',url)
+    config = Config(str(ROOT / 'alembic.ini'))
+    command.upgrade(config, '0003_legacy_decline_scope')
+    engine = engine_for(url)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    s = seed_old_session(factory, [])
+    with factory.begin() as db:
+        sid = s['id']
+        r = Receipt(sid=sid,request_id=str(uuid4()),fingerprint='old',attempt='old',status='done')
+        db.add(r); db.flush()
+        u = Message(sid=sid,receipt=r.id,role='chen',speaker='user',body=PROJECT)
+        a = Message(sid=sid,receipt=r.id,role='chen',speaker='assistant',body='收到了。')
+        db.add_all([u,a]); db.flush()
+        entry = dict(field='project_experience',status='submitted',message_id=u.id,reply_id=a.id,quote=PROJECT,position=0)
+        db.add(RegistrationEntry(sid=sid,**entry))
+        original = {'total':None, 'registration':{'history':[dict(**entry, reply_quote=a.body)]}}
+        db.add_all([Review(sid=sid,rubric='evidence-only-v1',payload=original), Ending(sid=sid,kind='early',reason='',cited=[])])
+        db.get(Training,sid).closed = True
+    command.upgrade(config,'head')
+    with TestClient(create_app()) as client:
+        path, headers = '/api/sessions/'+sid, {'Authorization':'Bearer '+s['token']}
+        snap = client.get(path,headers=headers).json()
+        assert snap['review']['registration']['history'] == snap['registration']['history'] == [dict(**original['registration']['history'][0],source='chat')]
+        assert client.post(path+'/finish',headers=headers,json={'kind':'early'}).json() == snap['review']
+        assert confirm(client,path,headers,'city_b').status_code == 409
+    with factory() as db:
+        assert db.get(Review,sid).payload == original
+    engine.dispose()
 
 
 def test_upgrade_from_main_preserves_sessions_messages_and_saved_review(tmp_path, monkeypatch):
@@ -172,7 +251,7 @@ def test_upgrade_from_main_preserves_sessions_messages_and_saved_review(tmp_path
     assert 'registration_entries' not in inspect(engine).get_table_names()
     command.upgrade(config, 'head')
     with engine.connect() as conn:
-        assert conn.scalar(text('SELECT version_num FROM alembic_version')) == '0003_legacy_decline_scope'
+        assert conn.scalar(text('SELECT version_num FROM alembic_version')) == '0004_explicit_confirmation'
         assert conn.execute(text('PRAGMA foreign_key_check')).all() == []
     training.check_access(factory, sid, session['token'])
     snap = training.snapshot(factory, sid)

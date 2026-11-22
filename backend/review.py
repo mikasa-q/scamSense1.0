@@ -13,6 +13,17 @@ def message_dict(m):
 def ending_dict(e):
     return dict(kind=e.kind, choice=e.choice, label=CHOICES.get(e.choice, '提前结束训练'), reason=e.reason, cited=e.cited, created=e.created)
 
+def saved_review(review):
+    if review is None:
+        return None
+    payload = review.payload
+    reg = payload.get('registration')
+    if reg and any('source' not in e for e in reg.get('history', [])):
+        # Before confirmations existed every entry was backed by a real chat message.
+        return {**payload, 'registration': {**reg, 'history': [{'source':'chat', **e} for e in reg['history']]}}
+    return payload
+
+
 def make_review(db, sid, ending):
     rows = db.execute(select(Trace, Message).join(Message, Trace.message_id == Message.id).where(Trace.sid == sid).order_by(Trace.id)).all()
     groups = {key: [] for key, _, _ in DIMS}

@@ -13,8 +13,10 @@ export interface Dimension {key:string; label:string; weight:number; score:numbe
 export type FieldKey = 'project_experience'|'city'
 export const statusText = {agreed:'同意提供', submitted:'已提交', deferred:'暂缓', refused:'拒绝'} as const
 export type FieldStatus = keyof typeof statusText
-export interface FieldItem {key:FieldKey; label:string; placeholder:string; status:FieldStatus|null; quote:string|null; message_id:number|null}
-export interface FieldEntry {field:FieldKey; status:FieldStatus; quote:string; position:number; message_id:number; reply_id:number; reply_quote:string}
+export type OptionId = 'project_a'|'city_b'
+export interface FieldItem {key:FieldKey; option_id:OptionId; label:string; placeholder:string; status:FieldStatus|null; quote:string|null; message_id:number|null}
+export type FieldEntry = {source?:'chat'; field:FieldKey; status:FieldStatus; quote:string; position:number; message_id:number; reply_id:number; reply_quote:string}
+  | {source:'explicit'; field:FieldKey; status:'submitted'; value:string; created:string}
 export interface Registration {items:FieldItem[]; submitted:FieldKey[]; declined_all:boolean; scope_pending?:boolean; history:FieldEntry[]}
 export const submittedLabels = (r:Registration) => r.items.filter(i=>r.submitted.includes(i.key)).map(i=>i.label).join('、') || '无'
 export type Choice = 'verify'|'leave'|'continue'|'necessary_only'

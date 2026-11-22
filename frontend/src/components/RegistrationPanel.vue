@@ -1,36 +1,39 @@
 <script setup lang="ts">
-import {statusText, submittedLabels, type FieldItem, type FieldStatus, type Registration} from '../data'
+import {dateText, statusText, submittedLabels, type OptionId, type Registration} from '../data'
 
 defineProps<{registration:Registration; sid:string; locked:boolean; closed:boolean}>()
-const emit = defineEmits<{draft:[text:string]}>()
-function wording(item:FieldItem, status:FieldStatus) {
-  const field = item.label
-  return {agreed:`${field}可以给`, submitted:`我提交的${field}：${item.placeholder}`, deferred:`${field}先不提供`, refused:`我拒绝提供${field}`}[status]
-}
+const emit = defineEmits<{confirm:[option:OptionId]; draft:[text:string]}>()
+const choices = {agreed:'可以给', deferred:'先不提供', refused:'不愿提供'} as const
 </script>
 <template>
   <section class="registration-panel" aria-label="候选人预登记">
     <div class="dimension-title"><h3>候选人预登记</h3><span class="neutral-pill">仅限虚构资料</span></div>
-    <p v-if="registration.declined_all" class="muted">你已停止整个登记。之前的记录仍保留，可以继续问岗位问题。</p>
-    <p v-else-if="registration.scope_pending" class="muted">旧会话记下了拒绝，但没区分是拒绝一项还是停止整单。可以继续发言；系统会先核对当时的原话。</p>
-    <p v-else class="muted">可以分别表态，也可以继续提问。同意不等于提交；提交时请只填写该项的虚构占位值，不要附加其他城市或项目。</p>
+    <p v-if="closed" class="muted">训练已结束，以下为本场记录。</p>
+    <p v-else-if="registration.declined_all" class="muted">你已停止整个登记，不能提交。可以继续聊天，也可以明确告诉陈浩要重新开始登记。</p>
+    <p v-else-if="registration.scope_pending" class="muted">旧会话的拒绝范围尚待确认，暂不能提交；可以继续聊天。</p>
+    <p v-else class="muted">登记已开放。聊天只表达意愿；点下方按钮才会提交对应的虚构资料，不会发送聊天消息。</p>
     <ul class="field-list">
       <li v-for="item in registration.items" :key="item.key">
-        <div><b>{{item.label}}</b> <span class="stage-pill">{{item.status ? statusText[item.status] : '未表态'}}</span></div>
+        <div><b>{{item.label}}</b> <span class="stage-pill">{{registration.submitted.includes(item.key) ? '已提交' : '未提交'}}</span></div>
+        <small>最近聊天表态：{{item.status ? statusText[item.status] : '未表态'}}</small>
         <a v-if="item.message_id" :href="`#/chat/${sid}/chen?m=${item.message_id}`">你的原话：「{{item.quote}}」</a>
-        <details v-if="!closed && !registration.declined_all"><summary>拟写{{item.label}}的回应</summary>
-          <p>虚构占位值：{{item.placeholder}}。点选只写入草稿，不会发送。</p>
-          <div class="small-prompts"><button v-for="(label, status) in statusText" :key="status" type="button" :disabled="locked" @click="emit('draft',wording(item,status))">{{status==='submitted' ? '提交虚构占位值' : label}}</button></div>
+        <button v-if="!closed && !registration.declined_all && !registration.scope_pending" class="btn primary small" type="button" :disabled="locked || registration.submitted.includes(item.key)" @click="emit('confirm',item.option_id)">提交{{item.placeholder}}</button>
+        <details v-if="!closed && !registration.declined_all"><summary>拟写{{item.label}}的聊天表态</summary>
+          <small>只写入草稿，不会发送或提交资料。</small>
+          <div class="small-prompts"><button v-for="(phrase,status) in choices" :key="status" type="button" :disabled="locked" @click="emit('draft',item.label+phrase)">{{statusText[status]}}</button></div>
         </details>
       </li>
     </ul>
     <p><b>已提交项：</b>{{submittedLabels(registration)}}</p>
-    <div v-for="entry in registration.history.filter(e=>e.status==='submitted')" :key="`${entry.message_id}-${entry.field}-${entry.position}`" class="submission-ref"><a :href="`#/chat/${sid}/chen?m=${entry.message_id}`">提交原话：「{{entry.quote}}」</a></div>
+    <div v-for="(entry,i) in registration.history.filter(e=>e.status==='submitted')" :key="i" class="submission-ref">
+      <span v-if="entry.source==='explicit'">显式确认 · {{entry.value}} · {{dateText(entry.created)}}</span>
+      <a v-else :href="`#/chat/${sid}/chen?m=${entry.message_id}`">旧版聊天提交：「{{entry.quote}}」</a>
+    </div>
   </section>
 </template>
 <style scoped>
 .registration-panel{padding:14px 18px;border-top:1px solid var(--line);background:#f5f8ef}
-.registration-panel p,.registration-panel a,.registration-panel summary{font-size:13px;line-height:1.7}
+.registration-panel p,.registration-panel a,.submission-ref{font-size:13px;line-height:1.7}
 .field-list{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(200px,100%),1fr));gap:12px;margin:12px 0}
-.field-list li{padding-left:12px;border-left:3px solid #c4d5b3;min-width:0}.registration-panel a{display:block;text-decoration:underline;overflow-wrap:anywhere}.field-list summary{cursor:pointer}.field-list details{margin-top:6px}
+.field-list li{display:grid;align-content:start;justify-items:start;gap:5px;padding-left:12px;border-left:3px solid #c4d5b3;min-width:0}.registration-panel a{text-decoration:underline;overflow-wrap:anywhere}
 </style>
