@@ -1,4 +1,4 @@
-import type {EndForm,RecordItem,Report,Role,Session} from './data'
+import type {EndForm,OptionId,RecordItem,Report,Role,Session} from './data'
 const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/,'') + '/api'
 const auth = (r:RecordItem) => ({Authorization:`Bearer ${r.token}`})
 async function checked(path:string, init?:RequestInit) {
@@ -15,6 +15,8 @@ export const health = async ():Promise<{model_configured:boolean}> => (await che
 export const createSession = async ():Promise<Pick<RecordItem,'id'|'token'|'created'>> => (await checked('/sessions',{method:'POST'})).json()
 export const getSession = async (r:RecordItem):Promise<Session> => (await checked(`/sessions/${r.id}`,{headers:auth(r)})).json()
 export const finishSession = async (r:RecordItem, end:EndForm):Promise<Report> => (await checked(`/sessions/${r.id}/finish`,{method:'POST',headers:{...auth(r),'Content-Type':'application/json'},body:JSON.stringify(end)})).json()
+export const confirmRegistration = async (r:RecordItem, option:OptionId):Promise<Session> =>
+  (await checked(`/sessions/${r.id}/contacts/chen/registration/confirm`,{method:'POST',headers:{...auth(r),'Content-Type':'application/json'},body:JSON.stringify({option_id:option})})).json()
 export async function sendTurn(r:RecordItem, role:Role, text:string, requestId:string, progress:(s:string)=>void):Promise<Session> {
   const res = await checked(`/sessions/${r.id}/turns`,{method:'POST',headers:{...auth(r),'Content-Type':'application/json'},body:JSON.stringify({role,text,request_id:requestId})})
   const reader = res.body?.getReader()

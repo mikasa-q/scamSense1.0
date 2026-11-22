@@ -5,18 +5,30 @@ from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
+from .registration import Availability, CHAT_STATUSES, FieldKey, Status, availability
+
 Role = Literal['lin', 'chen', 'wang']
 Focus = Literal['K01', 'K02', 'K03', 'K04', 'K05', 'none']
-ActionKind = Literal['interest', 'respond_registration', 'decline', 'ask_employer', 'ask_data', 'verify_official', 'verify_friend', 'identify_gap', 'weigh_sources']
+ActionKind = Literal['interest', 'respond_registration', 'decline', 'resume_registration', 'ask_employer', 'ask_data', 'verify_official', 'verify_friend', 'identify_gap', 'weigh_sources']
+REGISTRATION_ACTIONS = {'respond_registration', 'decline', 'resume_registration'}
 
 class Action(BaseModel):
     kind: ActionKind
     focus: Focus
     quote: str = Field(min_length=2, max_length=600)
     source: Literal['own', 'retold', 'uncertain']
+    opportunity: Literal['lin', 'chen'] | None = None
+    field: FieldKey | None = None
+    status: Status | None = None
+    position: int | None = Field(default=None, ge=0, lt=600)
 
 class Analysis(BaseModel):
     actions: list[Action] = Field(max_length=10)
+
+LegacyScope = Literal['city_only', 'project_only', 'city_later', 'project_later', 'items_only', 'whole', 'uncertain']
+
+class ChenAnalysis(Analysis):
+    legacy_scopes: dict[int, LegacyScope] = Field(default_factory=dict)
 
 class Reply(BaseModel):
     body: str = Field(min_length=1, max_length=800)
@@ -37,6 +49,12 @@ class Audit(BaseModel):
     registration_quote: str | None
     k05: list[K05Claim] | None = Field(default=None, max_length=24)
 
+class ChenAudit(Audit):
+    received_now: list[FieldKey | Literal['unspecified']] = Field(max_length=3)
+    previously_received: list[FieldKey | Literal['unspecified']] = Field(max_length=3)
+    reply_availability: Availability | Literal['unstated', 'conflicting']
+    legacy_scopes: dict[int, LegacyScope] = Field(default_factory=dict)
+
 SCENE = '虚构校园求职场景：一则初级 Python 后端开发实习机会在校园求职群里转发。人物、企业和岗位均为虚构。'
 ROLES = json.loads(Path(__file__).with_name('role_cards.json').read_text(encoding='utf-8'))
 FACTS = {
@@ -51,12 +69,14 @@ FACTS = {
 }
 FOCI = {'K01': '招聘主体与授权关系', 'K02': '资料用途与必要性', 'K03': '保存期限与第三方处理', 'K04': '可独立核对的官方依据', 'K05': '同学是否亲自核实'}
 RULES = {
-    'interest': {'none'}, 'respond_registration': {'none'}, 'decline': {'none'},
+    'interest': {'none'}, 'respond_registration': {'none'}, 'decline': {'none'}, 'resume_registration': {'none'},
     'ask_employer': {'K01'}, 'ask_data': {'K02','K03'}, 'verify_official': {'K04'}, 'verify_friend': {'K05'},
     'identify_gap': set(FOCI), 'weigh_sources': set(FOCI),
 }
 ASKS = {'ask_employer','ask_data','verify_official','verify_friend'}
 WHY = {
+    'decline': '你明确停止了整个登记，不再主动邀请。',
+    'resume_registration': '你主动提出恢复登记，不代表已经提交资料。',
     'ask_employer': '你主动询问了招聘主体或招聘授权。', 'ask_data': '你主动追问了资料的处理或必要性。',
     'verify_official': '你主动寻找了可以独立核对的依据；提问不等于已核实。', 'verify_friend': '你向同学本人核对消息来源，而非把转发当作确认。',
     'identify_gap': '你用自己的话指出了这条信息仍缺少什么依据。', 'weigh_sources': '你区分了信息来源，说明了现有材料不能证明什么。',
@@ -83,23 +103,95 @@ def check_generated(body):
             raise ValueError('sensitive solicitation')
 
 def validate_actions(analysis, body, role, registered):
-    result, seen = [], set()
+    result, seen = [], {}
     for a in analysis.actions:
-        if a.source != 'own' or a.quote not in body or a.focus not in RULES[a.kind] or (a.kind, a.focus) in seen:
+        if a.source != 'own' or not a.quote.strip() or a.quote not in body or a.focus not in RULES[a.kind]:
+            continue
+        if a.kind == 'interest' and role == 'chen' and a.opportunity != role:
             continue
         if a.kind == 'verify_friend' and role != 'wang':
             continue
-        if (a.kind in {'respond_registration','decline'} and role != 'chen') or (a.kind == 'respond_registration' and not registered):
+        if a.kind in REGISTRATION_ACTIONS and role != 'chen':
             continue
-        result.append(a)
-        seen.add((a.kind, a.focus))
-    return result
+        if a.kind == 'respond_registration':
+            if not registered or not a.field or not a.status:
+                continue
+        elif a.field or a.status:
+            continue
+        pos = body.index(a.quote)
+        if a.status == 'submitted':
+            # Even a supported model candidate is never a chat disposition or a receipt.
+            result.append((pos, a))
+            continue
+        if a.kind in REGISTRATION_ACTIONS:
+            if a.position is not None:
+                pos = a.position
+                if not body.startswith(a.quote, pos):
+                    raise ValueError('registration quote position does not match the message')
+            elif body.find(a.quote, pos + 1) != -1:
+                raise ValueError('ambiguous registration quote position')
+            a = a.model_copy(update={'position': pos})
+        key = (a.kind, a.focus, a.field, a.position if a.kind in REGISTRATION_ACTIONS else None)
+        evidence = a.status
+        if key in seen:
+            if seen[key] != evidence:
+                raise ValueError('conflicting registration choices at the same position')
+            continue
+        result.append((pos, a))
+        seen[key] = evidence
+    if role != 'chen':
+        return [a for _, a in result]
+    ordered = [a for _, a in sorted(result, key=lambda item: item[0])]
+    controls = [a for a in ordered if a.kind in {'decline', 'resume_registration'}]
+    for control in controls:
+        for a in ordered:
+            if a is not control and a.kind in REGISTRATION_ACTIONS and a.status != 'submitted' and max(a.position, control.position) < min(a.position + len(a.quote), control.position + len(control.quote)):
+                raise ValueError('overlapping registration control and response')
+    return ordered
 
-def permission(role, actions, previous, refused):
+
+class RegistrationTurn(BaseModel):
+    availability: Availability
+    allow_invitation: bool
+    this_turn: list[Action]
+
+
+def registration_turn(state, actions):
+    if state is None:
+        return None
+    paused, pending = state['declined_all'], state.get('scope_pending', False)
+    invite, effective = False, []
+    for a in actions:
+        if a.kind == 'decline' and not paused:
+            paused, pending, invite = True, False, False
+        elif a.kind == 'resume_registration' and (paused or pending):
+            paused, pending = False, False
+        elif a.kind == 'interest' and a.opportunity == 'chen' and not (paused or pending) and not state['invited']:
+            invite = True
+            continue
+        elif a.kind != 'respond_registration' or a.status not in CHAT_STATUSES or not state['invited'] or paused or pending:
+            continue
+        effective.append(a)
+    return RegistrationTurn(availability=availability(state['invited'], paused, pending), allow_invitation=invite, this_turn=effective)
+
+
+def validate_registration_reply(audit, turn, invited_now, submitted):
+    if audit.received_now:
+        raise ValueError('chat cannot acknowledge a new receipt')
+    possible_prior = set(submitted) | ({'unspecified'} if submitted else set())
+    if set(audit.previously_received) - possible_prior:
+        raise ValueError('reply invents a previous receipt')
+    actual = 'open' if invited_now else turn.availability
+    if audit.reply_availability not in ('unstated', actual):
+        raise ValueError('reply contradicts registration availability')
+    if any(a.kind == 'resume_registration' for a in turn.this_turn) and actual == 'open' and audit.reply_availability != 'open':
+        raise ValueError('reply did not confirm that registration is open again')
+
+
+def permission(role, actions, previous, turn):
     wanted = set(previous) | {a.focus for a in actions if a.kind in ASKS}
     facts = {k:v for k,v in FACTS[role].items() if k in wanted}
-    invite = role == 'chen' and not refused and any(a.kind == 'interest' for a in actions) and not any(a.kind == 'decline' for a in actions)
-    return facts, invite
+    return facts, bool(role == 'chen' and turn and turn.allow_invitation)
 
 def k05_parts(body):
     marks = '，,。！？!?；;\n'

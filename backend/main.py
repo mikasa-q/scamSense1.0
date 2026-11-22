@@ -16,6 +16,11 @@ from . import training
 from .db import ROOT, database_url, engine_for
 from .model import CompatibleModel
 from .policy import Role, sensitive
+from .registration import OptionId
+
+class ConfirmationInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    option_id: OptionId
 
 class TurnInput(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
@@ -26,7 +31,7 @@ class TurnInput(BaseModel):
 class EndInput(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     kind: Literal['early', 'decision']
-    choice: Literal['verify','leave','continue'] | None = None
+    choice: Literal['verify','leave','continue','necessary_only'] | None = None
     reason: str = Field(default='', max_length=600)
     cited: list[int] = Field(default_factory=list, max_length=6)
 
@@ -76,11 +81,19 @@ def create_app(url=None, model=None):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         return response
 
-    def owned(sid: str, authorization: Annotated[str | None, Header()] = None):
+    def bearer(authorization: Annotated[str | None, Header()] = None):
         token = (authorization or '').removeprefix('Bearer ')
         if not authorization or token == authorization:
             raise HTTPException(401, '需要本场训练的访问凭据。')
+        return token
+
+    def owned(sid: str, token: Annotated[str, Depends(bearer)]):
         training.check_access(factory, sid, token)
+
+    @app.post('/api/sessions/{sid}/contacts/{role}/registration/confirm')
+    def confirm(sid: str, role: Role, data: ConfirmationInput, token: Annotated[str, Depends(bearer)]):
+        training.confirm_registration(factory, sid, token, role, data.option_id)
+        return training.snapshot(factory, sid)
 
     @app.get('/api/health')
     def health():
