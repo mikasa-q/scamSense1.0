@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from . import training
 from .db import ROOT, database_url, engine_for
 from .model import CompatibleModel
-from .policy import Role, sensitive
+from .policy import InvalidSubmissionValue, Role, sensitive
 
 class TurnInput(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
@@ -104,6 +104,8 @@ def create_app(url=None, model=None):
                 try:
                     ok = await training.run_turn(factory, model, sid, reservation, data.role, data.text, lambda status:queue.put_nowait(('progress',{'text':status})))
                     queue.put_nowait(('done', {'cached':False}) if ok else ('error', {'detail':'本轮模型调用或事实校验未通过，没有写入对话。可原样重试。'}))
+                except InvalidSubmissionValue:
+                    queue.put_nowait(('error', {'detail':'本轮未写入。请把要提交的每项单独写成「所在城市：虚构城市 B」或「项目经历：虚构项目 A」，不要附加其他值。'}))
                 except Exception:
                     queue.put_nowait(('error', {'detail':'本轮状态暂不可读，请刷新核实后重试。'}))
             task = asyncio.create_task(work())

@@ -12,7 +12,8 @@ function wording(item:FieldItem, status:FieldStatus) {
   <section class="registration-panel" aria-label="候选人预登记">
     <div class="dimension-title"><h3>候选人预登记</h3><span class="neutral-pill">仅限虚构资料</span></div>
     <p v-if="registration.declined_all" class="muted">你已停止整个登记。之前的记录仍保留，可以继续问岗位问题。</p>
-    <p v-else class="muted">可以分别表态，也可以继续提问。同意不等于提交；只有发出对应的虚构占位值才算提交。</p>
+    <p v-else-if="registration.scope_pending" class="muted">旧会话记下了拒绝，但没区分是拒绝一项还是停止整单。可以继续发言；系统会先核对当时的原话。</p>
+    <p v-else class="muted">可以分别表态，也可以继续提问。同意不等于提交；提交时请只填写该项的虚构占位值，不要附加其他城市或项目。</p>
     <ul class="field-list">
       <li v-for="item in registration.items" :key="item.key">
         <div><b>{{item.label}}</b> <span class="stage-pill">{{item.status ? statusText[item.status] : '未表态'}}</span></div>

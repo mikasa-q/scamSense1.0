@@ -288,7 +288,7 @@ def test_concurrent_and_stale_attempts_cannot_commit(lab):
     with factory.begin() as db: db.get(Training,lab.sid).lock_until = 0
     _, fresh = training.reserve(factory,lab.sid,rid,'wang',ASK,True)
     assert fresh != expired
-    with pytest.raises(ValueError): training.store_turn(factory,lab.sid,receipt,expired,'wang',ASK,ANSWER,[],{},None,False)
+    with pytest.raises(ValueError): training.store_turn(factory,lab.sid,receipt,expired,'wang',ASK,ANSWER,[],{},None,False,{})
     training.fail_turn(factory,lab.sid,receipt,expired)
     assert lab.snap()['busy'] and not lab.snap()['messages']
     training.fail_turn(factory,lab.sid,receipt,fresh)
@@ -420,6 +420,41 @@ def test_unverified_item_changes_never_commit(lab, failure):
     assert 'event: error' in lab.post(text,'chen').text
     after = lab.snap()
     assert after['registration'] == before['registration'] and after['messages'] == before['messages']
+
+
+@pytest.mark.parametrize(('field', 'prefix', 'value', 'quote'), [
+    ('city', '我提交的所在城市：', '虚构城市 B市', '虚构城市 B市'),
+    ('city', '我提交的所在城市：', '虚构城市 B市', '虚构城市 B'),
+    ('city', '所在城市：', '虚构城市 B、杭州', '虚构城市 B'),
+    ('city', '所在城市：', '虚构城市 B，杭州', '虚构城市 B'),
+    ('city', '所在城市：', '杭州 / 虚构城市 B', '虚构城市 B'),
+    ('city', '所在城市：', '杭州。我的城市是虚构城市 B', '我的城市是虚构城市 B'),
+    ('city', '所在城市：', '虚构城市 B（也填杭州）', '虚构城市 B'),
+    ('project_experience', '我提交的项目经历：', '虚构项目 A1', '虚构项目 A'),
+    ('project_experience', '项目经历：', '虚构项目 A 和另一个项目', '虚构项目 A 和另一个项目'),
+])
+def test_mixed_or_truncated_value_rolls_back_entire_turn(lab, field, prefix, value, quote):
+    model = propose(lab)
+    other = '项目经历可以给' if field == 'city' else '所在城市可以给'
+    other_field = 'project_experience' if field == 'city' else 'city'
+    model.actions = [action('respond_registration', 'none', other, field=other_field, status='agreed'),
+                     action('respond_registration', 'none', quote, field=field, status='submitted')]
+    model.body, model.received = '本轮资料已收到。', [field]
+    before = lab.snap()
+    assert 'event: error' in lab.post(other+'；'+prefix+value, 'chen').text
+    assert lab.snap() == before
+
+
+def test_two_exact_values_with_separate_clauses_can_be_submitted(lab):
+    model = propose(lab)
+    project, city = '这次我提交项目经历：虚构项目 A', '我的所在城市是「虚构城市 B」'
+    model.actions = [action('respond_registration', 'none', city, field='city', status='submitted'),
+                     action('respond_registration', 'none', project, field='project_experience', status='submitted')]
+    model.body, model.received = '收到这两项虚构资料。', ['project_experience', 'city']
+    assert 'event: done' in lab.post(project+'；'+city+'。', 'chen').text
+    r = lab.snap()['registration']
+    assert r['submitted'] == ['project_experience', 'city']
+    assert [e['quote'] for e in r['history']] == [project, city]
 
 
 def stop_registration(lab):

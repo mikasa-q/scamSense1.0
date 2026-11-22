@@ -4,8 +4,8 @@ import time
 from fastapi import HTTPException
 from sqlalchemy import select
 from .db import Ending, Message, Receipt, RegistrationEntry, Review, StoryEvent, Trace, Training, uid, writer
-from .policy import ASKS, REGISTRATION_ACTIONS, WHY, check_generated, permission, registration_turn, validate_actions, validate_reply
-from .registration import declined_all, registration_log, registration_snapshot, registration_state, was_invited
+from .policy import ASKS, REGISTRATION_ACTIONS, WHY, InvalidSubmissionValue, check_generated, permission, registration_turn, validate_actions, validate_reply
+from .registration import LEGACY_TRACE_KIND, apply_legacy_refusal, registration_controls, registration_log, registration_snapshot, registration_state, was_invited
 from .review import RUBRIC, make_review, message_dict
 
 
@@ -71,20 +71,26 @@ def private_context(factory, sid, role):
         previous = set(db.scalars(select(Trace.focus).join(Message, Message.id == Trace.message_id).where(Trace.sid == sid, Trace.kind == 'disclosure', Message.role == role)))
         registration = None
         if role == 'chen':
-            registration = registration_state(registration_log(db, sid))
+            registration = registration_state(db, sid, registration_log(db, sid))
             registration['invited'] = was_invited(db, sid)
-            registration['declined_all'] = declined_all(db, sid)
+            registration['declined_all'], pending = registration_controls(db, sid)
+            if pending:
+                registration['legacy_declines'] = pending
         return history, previous, registration
 
 def record_event(db, s, kind, stage, mid=None):
     s.stage = max(s.stage, stage)
     db.add(StoryEvent(sid=s.id, kind=kind, stage=s.stage, message_id=mid))
 
-def store_turn(factory, sid, rid, attempt, role, text, body, actions, disclosed, reg, registered):
+def store_turn(factory, sid, rid, attempt, role, text, body, actions, disclosed, reg, registered, legacy_scopes):
     with writer(factory) as db:
         s, receipt = db.get(Training, sid), db.get(Receipt, rid)
         if s.closed or s.locked_by != attempt or receipt.attempt != attempt or not is_busy(s):
             raise ValueError('stale attempt')
+        for trace_id, scope in legacy_scopes.items():
+            if scope != 'uncertain':
+                trace = db.get(Trace, trace_id)
+                trace.kind = LEGACY_TRACE_KIND[scope]
         user = Message(sid=sid, receipt=rid, role=role, speaker='user', body=text)
         reply = Message(sid=sid, receipt=rid, role=role, speaker='assistant', body=body)
         db.add_all([user,reply])
@@ -126,7 +132,17 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
         progress('正在理解你的发言')
         analysis = await model.analyze(role, history, text, registration)
         actions = validate_actions(analysis, text, role, registered)
-        plan = registration_turn(registration, actions)
+        legacy_scopes = {}
+        if registration and (pending := registration.get('legacy_declines')):
+            legacy_scopes = analysis.legacy_scopes
+            if set(legacy_scopes) != {row['id'] for row in pending}:
+                raise ValueError('legacy refusal evidence was not fully classified')
+            registration['scope_pending'] = 'uncertain' in legacy_scopes.values()
+            registration['declined_all'] = 'whole' in legacy_scopes.values()
+            for row in pending:
+                apply_legacy_refusal(registration['items'], LEGACY_TRACE_KIND.get(legacy_scopes[row['id']]),
+                                     row['quote'], row['message_id'])
+        plan = registration_turn(registration, actions, text)
         facts, invite = permission(role, actions, previous, plan)
         context = {**registration, **plan.model_dump(exclude={'allow_invitation'}, exclude_none=True)} if plan else None
         progress('联系人正在组织回复')
@@ -136,17 +152,21 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
         audit = await model.audit(role, history, text, facts, invite, actions, reply.body, context)
         body, valid, disclosed, reg = validate_reply(reply, audit, actions, facts, previous, invite, role=role)
         if plan is not None:
-            audited = registration_turn(registration, valid)
+            if audit.legacy_scopes != legacy_scopes:
+                raise ValueError('legacy refusal scope not independently confirmed')
+            audited = registration_turn(registration, valid, text)
             if audited != plan:
                 raise ValueError('audited registration differs from the context used to generate the reply')
             submitted = {a.field for a in audited.this_turn if a.status == 'submitted'}
             if set(audit.received_now) - submitted:
                 raise ValueError('reply acknowledges an unauthorized submission')
             valid = [a for a in valid if a.kind not in REGISTRATION_ACTIONS or a in audited.this_turn]
-        store_turn(factory, sid, rid, attempt, role, text, body, valid, disclosed, reg, registered)
+        store_turn(factory, sid, rid, attempt, role, text, body, valid, disclosed, reg, registered, legacy_scopes)
         return True
-    except Exception:
+    except Exception as exc:
         fail_turn(factory, sid, rid, attempt)
+        if isinstance(exc, InvalidSubmissionValue):
+            raise
         return False
 
 def finish(factory, sid, kind, choice, reason, cited):

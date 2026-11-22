@@ -25,6 +25,11 @@ class Action(BaseModel):
 class Analysis(BaseModel):
     actions: list[Action] = Field(max_length=10)
 
+LegacyScope = Literal['city_only', 'project_only', 'city_later', 'project_later', 'items_only', 'whole', 'uncertain']
+
+class ChenAnalysis(Analysis):
+    legacy_scopes: dict[int, LegacyScope] = Field(default_factory=dict)
+
 class Reply(BaseModel):
     body: str = Field(min_length=1, max_length=800)
 
@@ -46,6 +51,7 @@ class Audit(BaseModel):
 
 class ChenAudit(Audit):
     received_now: list[FieldKey] = Field(max_length=2)
+    legacy_scopes: dict[int, LegacyScope] = Field(default_factory=dict)
 
 SCENE = '虚构校园求职场景：一则初级 Python 后端开发实习机会在校园求职群里转发。人物、企业和岗位均为虚构。'
 ROLES = json.loads(Path(__file__).with_name('role_cards.json').read_text(encoding='utf-8'))
@@ -143,23 +149,67 @@ class RegistrationTurn(BaseModel):
     this_turn: list[Action]
 
 
-def registration_turn(state, actions):
+class InvalidSubmissionValue(ValueError):
+    pass
+
+
+CLAUSE_MARKS = '，,。.!！?？;；\n'
+
+
+def check_submission_values(text, actions, submissions):
+    # Validate the full source clauses, not just the excerpts the model selected.
+    clauses = list(re.finditer(rf'[^{re.escape(CLAUSE_MARKS)}]+', text))
+    checked = set()
+    for a in submissions:
+        value = FIELDS[a.field]['placeholder']
+        if value not in a.quote:
+            raise InvalidSubmissionValue()
+        pos = a.position + a.quote.index(value)
+        clause = next(c for c in clauses if c.start() <= pos < c.end())
+        label = '(?:所在)?城市' if a.field == 'city' else '项目(?:经历)?'
+        prefix = rf'(?:这次|现在|本次)?(?:我|本人)?(?:这次|现在|本次)?(?:提交|提供|填写|登记|给出)?的?(?:{label})?(?:填写|提交|填|为|是)?\s*[：:=]?\s*'
+        literal = re.escape(value)
+        if not re.fullmatch(prefix + rf'(?:{literal}|「{literal}」|“{literal}”|"{literal}")', clause.group().strip()):
+            raise InvalidSubmissionValue()
+        if a.quote.strip(CLAUSE_MARKS + ' \t') not in clause.group():
+            raise InvalidSubmissionValue()
+        checked.add(clause.start())
+
+    # A separator may introduce another choice, but must never hide an extra data value.
+    other_clauses = set()
+    for a in actions:
+        if a in submissions:
+            continue
+        start = a.position if a.position is not None else text.index(a.quote)
+        content = a.quote.strip(CLAUSE_MARKS + ' \t')
+        other_clauses.add((start + a.quote.index(content), content))
+    for clause in clauses:
+        content = clause.group().strip()
+        if clause.start() in checked or not content or content in {'算了', '不过', '另外', '谢谢'}:
+            continue
+        if (clause.start() + clause.group().index(content), content) not in other_clauses:
+            raise InvalidSubmissionValue()
+
+
+def registration_turn(state, actions, text):
     if state is None:
         return None
-    paused, invite, effective = state['declined_all'], False, []
+    paused, pending = state['declined_all'], state.get('scope_pending', False)
+    invite, effective = False, []
     for a in actions:
         if a.kind == 'decline' and not paused:
-            paused, invite = True, False
-        elif a.kind == 'resume_registration' and paused:
-            paused = False
-        elif a.kind == 'respond_registration' and state['invited'] and not paused:
-            if a.status == 'submitted' and FIELDS[a.field]['placeholder'] not in a.quote:
-                raise ValueError('submission lacks its fictional value')
-        else:
-            if a.kind == 'interest' and a.opportunity == 'chen' and not paused and not state['invited']:
-                invite = True
+            paused, pending, invite = True, False, False
+        elif a.kind == 'resume_registration' and (paused or pending):
+            paused, pending = False, False
+        elif a.kind == 'interest' and a.opportunity == 'chen' and not (paused or pending) and not state['invited']:
+            invite = True
+            continue
+        elif a.kind != 'respond_registration' or not state['invited'] or paused or pending:
             continue
         effective.append(a)
+    submissions = [a for a in effective if a.status == 'submitted']
+    if submissions:
+        check_submission_values(text, actions, submissions)
     return RegistrationTurn(stopped_after=paused, allow_invitation=invite, this_turn=effective)
 
 

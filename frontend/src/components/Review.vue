@@ -8,6 +8,7 @@ const link=(ref:RefQuote)=>`#/chat/${props.sid}/${ref.role}?m=${ref.message_id}`
   <section v-if="report.registration" class="desk-section" aria-label="登记复盘"><header class="section-head"><h2>陈浩的虚构预登记</h2></header><div class="panel clues">
     <h3>已提交项：{{submittedLabels(report.registration)}}</h3><p class="muted">同意提供、重启登记和终局决定都不算实际提交。</p>
     <p v-if="report.registration.declined_all">已停止整个登记。之前实际提交的记录仍然保留。</p>
+    <p v-else-if="report.registration.scope_pending">旧会话留有拒绝原话，但无法确认当时是否停止了整个登记。</p>
     <p v-for="i in report.registration.items" :key="i.key">{{i.label}} · {{i.status ? statusText[i.status] : '未表态'}}</p>
     <article v-for="e in report.registration.references" :key="`${e.message_id}-${e.quote}`" class="ref-entry"><small>{{e.speaker==='user'?'你':'陈浩'}} · {{e.why}}</small><blockquote>{{e.quote}}</blockquote><a :href="link(e)">定位原话 <CornerDownLeft :size="13"/></a></article>
     <article v-for="(e,i) in report.registration.history" :key="i" class="ref-entry"><small>你 · {{report.registration.items.find(item=>item.key===e.field)?.label}} · {{statusText[e.status]}}</small><blockquote>{{e.quote}}</blockquote><a :href="`#/chat/${sid}/chen?m=${e.message_id}`">定位你的原话</a> · <a :href="`#/chat/${sid}/chen?m=${e.reply_id}`">查看陈浩当时的回复</a></article>
