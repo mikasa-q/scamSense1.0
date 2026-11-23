@@ -4,7 +4,7 @@ import time
 from fastapi import HTTPException
 from sqlalchemy import select
 from .db import Ending, Message, Receipt, RegistrationConfirmation, RegistrationEntry, Review, StoryEvent, Trace, Training, uid, writer
-from .policy import ASKS, REGISTRATION_ACTIONS, WHY, check_generated, permission, registration_turn, validate_actions, validate_registration_reply, validate_reply
+from .policy import ASKS, DISCLOSURE_KINDS, K04_BY_ROLE, REGISTRATION_ACTIONS, WHY, check_generated, permission, registration_turn, validate_actions, validate_registration_reply, validate_reply
 from .registration import CHAT_STATUSES, FIELDS, LEGACY_TRACE_KIND, OPTIONS, apply_legacy_refusal, availability, registration_controls, registration_log, registration_snapshot, registration_state, was_invited
 from .review import RUBRIC, make_review, message_dict, saved_review
 
@@ -96,7 +96,7 @@ def private_context(factory, sid, role):
     with factory() as db:
         msgs = db.scalars(select(Message).where(Message.sid == sid, Message.role == role).order_by(Message.id.desc()).limit(24)).all()
         history = [{'speaker':m.speaker, 'text':m.body} for m in reversed(msgs)]
-        previous = set(db.scalars(select(Trace.focus).join(Message, Message.id == Trace.message_id).where(Trace.sid == sid, Trace.kind == 'disclosure', Message.role == role)))
+        previous = set(db.scalars(select(Trace.focus).join(Message, Message.id == Trace.message_id).where(Trace.sid == sid, Trace.kind.in_(DISCLOSURE_KINDS), Message.role == role)))
         registration = None
         if role == 'chen':
             registration = registration_state(db, sid, registration_log(db, sid))
@@ -142,7 +142,8 @@ def store_turn(factory, sid, rid, attempt, role, text, body, actions, disclosed,
             db.add(Trace(sid=sid, message_id=reply.id, kind='registration_proposed',
                          focus='none', quote=reg, why='陈浩实际发出了虚构预登记邀请。'))
         for focus, quote in disclosed.items():
-            db.add(Trace(sid=sid, message_id=reply.id, kind='disclosure', focus=focus, quote=quote, why=WHY['disclosure']))
+            kind = K04_BY_ROLE[role] if focus == 'K04' else 'disclosure'
+            db.add(Trace(sid=sid, message_id=reply.id, kind=kind, focus=focus, quote=quote, why=WHY[kind]))
             s.stage = max(s.stage, 3)
         receipt.status, s.locked_by, s.lock_until = 'done', None, 0
 

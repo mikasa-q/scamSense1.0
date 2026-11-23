@@ -47,6 +47,7 @@ class Audit(BaseModel):
     supported: list[int] = Field(max_length=10)
     disclosures: list[Disclosure] = Field(max_length=5)
     registration_quote: str | None
+    k04: Literal['none', 'k04_interview_route', 'k04_missing_reference', 'unsupported_claim'] | None = None
     k05: list[K05Claim] | None = Field(default=None, max_length=24)
 
 class ChenAudit(Audit):
@@ -68,6 +69,9 @@ FACTS = {
     'wang': {'K05': '王宇本人没有亲自向招聘方核实过这条转发，也没有独立验证发布者的身份。'},
 }
 FOCI = {'K01': '招聘主体与授权关系', 'K02': '资料用途与必要性', 'K03': '保存期限与第三方处理', 'K04': '可独立核对的官方依据', 'K05': '同学是否亲自核实'}
+K04_BY_ROLE = {'lin':'k04_interview_route', 'chen':'k04_missing_reference'}
+K04_TOPICS = {'k04_interview_route':'本人面试的独立核对途径', 'k04_missing_reference':'转发目前缺少可核对依据'}
+DISCLOSURE_KINDS = ('disclosure', *K04_TOPICS)
 RULES = {
     'interest': {'none'}, 'respond_registration': {'none'}, 'decline': {'none'}, 'resume_registration': {'none'},
     'ask_employer': {'K01'}, 'ask_data': {'K02','K03'}, 'verify_official': {'K04'}, 'verify_friend': {'K05'},
@@ -81,6 +85,8 @@ WHY = {
     'verify_official': '你主动寻找了可以独立核对的依据；提问不等于已核实。', 'verify_friend': '你向同学本人核对消息来源，而非把转发当作确认。',
     'identify_gap': '你用自己的话指出了这条信息仍缺少什么依据。', 'weigh_sources': '你区分了信息来源，说明了现有材料不能证明什么。',
     'disclosure': '这段角色原话实际披露了该事实；不计作你的识别证据。',
+    'k04_interview_route': '林悦给出了核对自己面试流程的办法。这不能证实群转发的岗位或顾问关系。',
+    'k04_missing_reference': '陈浩说明目前拿不出可独立核对这条转发的官方依据。这不是核实途径，也不证明机会为真或为假。',
 }
 PHONE_OR_ID = re.compile(r'(?<!\d)(?:1[3-9]\d{9}|\d{15,19}[Xx]?)(?!\d)')
 MAIL = re.compile(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}')
@@ -205,18 +211,27 @@ def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
         raise ValueError('invalid evidence indexes')
     valid = [a for i,a in enumerate(actions) if i in audit.supported]
     allowed = {a.focus for a in valid if a.kind in ASKS}
-    # A candidate rejected during audit cannot open a new fact gate.
-    if (set(facts) - set(previous)) - allowed:
+    unverified = set(facts) - set(previous) - allowed
+    # A rejected K04 question need not discard a harmless reply that didn't use its fact.
+    if unverified - {'K04'}:
         raise ValueError('unverified permission')
     parts = k05_parts(body) if role == 'wang' else []
     disclosed = {}
     for d in audit.disclosures:
         if d.focus not in facts or d.quote not in body:
             raise ValueError('unattributed disclosure')
+        if d.focus == 'K04':
+            continue  # A topic excerpt cannot establish what the complete reply meant.
         if d.focus != 'K05':
             disclosed.setdefault(d.focus, d.quote)
         elif role != 'wang' or (d.quote != body and d.quote not in parts):
             raise ValueError('unexpected K05 excerpt')
+    if 'K04' in facts and audit.k04 is None:
+        raise ValueError('missing K04 assessment')
+    if audit.k04 not in (None, 'none'):
+        if audit.k04 != K04_BY_ROLE.get(role) or 'K04' not in facts or 'K04' in unverified:
+            raise ValueError('unsupported or unapproved K04 claim')
+        disclosed['K04'] = body
     if (role == 'wang') != (audit.k05 is not None):
         raise ValueError('missing or out-of-scope K05 assessment')
     if audit.k05 is not None:

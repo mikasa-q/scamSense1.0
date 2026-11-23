@@ -1,6 +1,6 @@
 from sqlalchemy import select
 from .db import Message, Trace
-from .policy import ASKS, FOCI
+from .policy import ASKS, DISCLOSURE_KINDS, FOCI, K04_TOPICS
 from .registration import LEGACY_ITEMS, registration_snapshot
 
 RUBRIC = 'evidence-only-v1'
@@ -30,7 +30,9 @@ def make_review(db, sid, ending):
     disclosures = []
     for t, m in rows:
         ref = dict(role=m.role, speaker=m.speaker, message_id=m.id, focus=t.focus, topic=FOCI.get(t.focus, ''), quote=t.quote, why=t.why)
-        if t.kind == 'disclosure':
+        if t.kind in DISCLOSURE_KINDS:
+            if t.kind in K04_TOPICS:
+                ref['topic'] = K04_TOPICS[t.kind]
             disclosures.append(ref)
         elif t.kind in ASKS:
             groups['verify'].append(ref)
