@@ -13,9 +13,9 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import func, select
 
-from backend.db import ROOT, Receipt, StoryEvent, Trace
+from backend.db import ROOT, Message, Receipt, StoryEvent, Trace
 from backend.main import create_app
-from backend.model import CompatibleModel
+from backend.model import GENERATE, K05_AUDIT, K05_INTERPRET, CompatibleModel
 from test_model_wire import (CHEN_ASK, CHEN_GAP, INTEREST, LIN_ASK, LIN_ROUTE, MIXED,
                              QUESTION, REPLY, RESUME, STOP, wire_fixture)
 
@@ -163,6 +163,63 @@ def test_refresh_during_sse_and_replay_completed_request(ui, monkeypatch):
     assert replay.ok and '"cached":true' in replay.text()
     assert counts(ui, sid) == before == (1, 2, 2) and len(ui.calls) == 3
     p.reload(); expect(p.locator('.message')).to_have_count(2)
+
+
+def test_refresh_during_sse_recovers_over_slow_session_reads(ui, monkeypatch):
+    from playwright.sync_api import expect
+    p, gate, entered = ui.page, threading.Event(), threading.Event()
+    sid = p.url.split('/chat/')[1].split('/')[0]
+    detail = f'{ui.url}/api/sessions/{sid}'
+    draft_key = f'scamsense.pending.{sid}.wang'
+    turn_ids = []
+    def record_turn(req):
+        if req.method == 'POST' and req.url == detail + '/turns':
+            turn_ids.append(req.post_data_json['request_id'])
+    p.on('request', record_turn)
+
+    reply = CompatibleModel.reply
+    async def hold(self, *args):
+        entered.set()
+        assert await asyncio.to_thread(gate.wait, 30)
+        return await reply(self, *args)
+    monkeypatch.setattr(CompatibleModel, 'reply', hold)
+    composer = p.locator('#message')
+    try:
+        composer.fill(QUESTION)
+        p.get_by_role('button', name='发送', exact=True).click()
+        assert entered.wait(8)
+        p.reload()
+        expect(p.locator('.working')).to_contain_text('上一次发言仍在处理')
+        expect(composer).to_be_disabled()
+        expect(composer).to_have_value(QUESTION)
+        assert turn_ids == [p.evaluate('k => JSON.parse(sessionStorage.getItem(k)).id', draft_key)]
+
+        # Throttle real responses without serializing concurrent requests in a route handler.
+        cdp = p.context.new_cdp_session(p)
+        cdp.send('Network.enable')
+        cdp.send('Network.emulateNetworkConditions', {
+            'offline': False, 'latency': 3200, 'downloadThroughput': -1, 'uploadThroughput': -1,
+        })
+        p.evaluate('performance.clearResourceTimings()')
+        busy = p.wait_for_event('response', predicate=lambda r: r.url == detail, timeout=15000)
+        assert busy.ok and busy.json()['busy']
+    finally:
+        gate.set()
+
+    expect(p.locator('.message.assistant p')).to_have_text([REPLY], timeout=16000)
+    expect(p.locator('.message.user p')).to_have_text([QUESTION])
+    expect(composer).to_be_enabled()
+    expect(composer).to_have_value('')
+    assert p.evaluate('k => sessionStorage.getItem(k) === null', draft_key)
+    reads = p.evaluate('url => performance.getEntriesByName(url).map(r => [r.startTime, r.responseEnd])', detail)
+    assert len(reads) >= 2 and all(end - start > 2500 for start, end in reads)
+    assert all(prev[1] <= nxt[0] for prev, nxt in zip(reads, reads[1:]))
+    assert len(turn_ids) == 1
+    with ui.factory() as db:
+        assert db.execute(select(Receipt.request_id, Receipt.status).where(Receipt.sid == sid)).one() == (turn_ids[0], 'done')
+        assert db.scalars(select(Message.speaker).where(Message.sid == sid).order_by(Message.id)).all() == ['user', 'assistant']
+    assert counts(ui, sid) == (1, 2, 2)
+    assert [prompt for prompt, _ in ui.calls] == [K05_INTERPRET, GENERATE, K05_AUDIT]
 
 
 def test_missing_terminal_sse_frame_recovers_committed_reply(ui):

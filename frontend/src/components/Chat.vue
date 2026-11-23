@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch} from 'vue'
+import {computed,nextTick,onMounted,ref,watch} from 'vue'
 import {ArrowLeft, ArrowRight, BookOpenText, ChevronRight, CircleAlert, Flag, LockKeyhole, MessageCircle, RefreshCw, SendHorizontal, ShieldCheck} from 'lucide-vue-next'
 import {keys, roles, scene, stages, timeText, privateText, type OptionId, type Role, type Session, type RecordItem} from '../data'
 import {confirmRegistration,getSession,sendTurn} from '../api'
 import Portrait from './Portrait.vue'
 import EndDialog from './EndDialog.vue'
 import RegistrationPanel from './RegistrationPanel.vue'
-const props=defineProps<{session:Session; record:RecordItem; role:Role; target:number; configured:boolean|null}>()
-const emit=defineEmits<{saved:[s:Session]; reload:[]; check:[]; ended:[]}>()
+const props=defineProps<{session:Session; record:RecordItem; role:Role; target:number; configured:boolean|null; reload:()=>Promise<void>}>()
+const emit=defineEmits<{saved:[s:Session]; check:[]; ended:[]}>()
 const visibleMessages=computed(()=>props.session.messages.filter(m=>m.role===props.role))
 const roleInfo=computed(()=>roles[props.role]); const text=ref(''), progress=ref(''), failure=ref(''), sending=ref(false)
 type Draft = {text:string; id:string}
@@ -29,8 +29,16 @@ async function confirm(option:OptionId) {
   }
   finally {confirming.value=false}
 }
-const poll=window.setInterval(()=>{if(props.session.busy && !sending.value) emit('reload')},2500)
-onBeforeUnmount(()=>window.clearInterval(poll))
+const recoveryInFlight=ref(false)
+watch(()=>props.session.busy && !sending.value && !recoveryInFlight.value,(needed,_,onCleanup)=>{
+  if(!needed) return
+  const timer=window.setTimeout(async()=>{
+    recoveryInFlight.value=true
+    try {await props.reload()}
+    finally {recoveryInFlight.value=false}
+  },2500)
+  onCleanup(()=>window.clearTimeout(timer))
+},{immediate:true})
 const threadLink=(role:Role)=>`#/chat/${props.session.id}/${role}`
 async function position() {await nextTick(); const target=props.target && document.getElementById(`msg-${props.target}`); if(target) target.scrollIntoView({block:'nearest'}); else if(scroll.value) scroll.value.scrollTop=scroll.value.scrollHeight}
 onMounted(position)
@@ -79,7 +87,7 @@ async function send() {
     const s=await sendTurn(props.record,role,body,rid,v=>progress.value=v)
     saveDraft(role,null); emit('saved',s)
     if(props.role===role) {text.value=''; lastRequest.value=null}
-  } catch(e) {if(props.role===role) failure.value=(e as Error).message; emit('reload'); emit('check')}
+  } catch(e) {if(props.role===role) failure.value=(e as Error).message; void props.reload(); emit('check')}
   finally {sending.value=false;progress.value='';pendingTurn.value=null; await nextTick();input.value?.focus()}
 }
 function enter(e:KeyboardEvent) {if(e.key==='Enter' && !e.isComposing && !e.shiftKey && e.keyCode!==229) {e.preventDefault();send()}}
