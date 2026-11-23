@@ -17,6 +17,7 @@ py -3.13 run.py --setup
 
 - [3–5 分钟现场演示／可选真模型冒烟清单](docs/demo.md)
 - [CVM 生产配置、同源或独立前端、SQLite 备份与恢复](docs/deploy.md)
+- [本次验收记录：本地、测试替身与未验证项](docs/verification.md)
 
 ## 真实对话配置
 
