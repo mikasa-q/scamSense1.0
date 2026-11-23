@@ -65,7 +65,7 @@ TURNS = {
 }
 
 @contextmanager
-def wire_fixture():
+def wire_fixture(api_root='/v1'):
     calls = []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -74,7 +74,7 @@ def wire_fixture():
             system = request['messages'][0]['content']
             data = json.loads(request['messages'][1]['content'])
             msg = data['current_user']
-            if self.path != '/v1/chat/completions' or msg not in TURNS or self.headers.get('Authorization'):
+            if self.path != api_root + '/chat/completions' or msg not in TURNS or self.headers.get('Authorization'):
                 self.send_error(400); return
             calls.append((system,data))
             pairs, reply, disclosures, kinds = TURNS[msg]
@@ -97,7 +97,7 @@ def wire_fixture():
             self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
     with ThreadingHTTPServer(('127.0.0.1',0),Handler) as server:
         th = threading.Thread(target=server.serve_forever,daemon=True); th.start()
-        try: yield f'http://127.0.0.1:{server.server_port}/v1', calls
+        try: yield f'http://127.0.0.1:{server.server_port}{api_root}', calls
         finally: server.shutdown(); th.join()
 
 @pytest.fixture
@@ -239,6 +239,72 @@ def test_only_confirmations_write_through_stop_and_restart(wired_session):
         report = fresh.post(path+'/finish', headers=headers, json={'kind':'decision','choice':'necessary_only'}).json()
         assert report['registration']['history'] == confirmed['registration']['history']
         assert [ref['quote'] for ref in report['registration']['references']] == [INVITE, STOP, RESUME]
+
+
+def test_second_training_never_inherits_history_facts_or_registration(wired_session):
+    client, first, first_headers, calls = wired_session
+    other = client.post('/api/sessions').json()
+    second, second_headers = '/api/sessions/' + other['id'], {'Authorization':'Bearer ' + other['token']}
+    shared_id = str(uuid4())
+    def send(path, headers, role, text, rid=None):
+        result = client.post(path+'/turns', headers=headers, json={'role':role, 'text':text, 'request_id':rid or str(uuid4())})
+        assert 'event: done' in result.text
+        return [data for _, data in calls[-3:]]
+    send(first, first_headers, 'chen', INTEREST, shared_id)
+    send(first, first_headers, 'chen', CHEN_ASK)
+    assert client.post(first+'/contacts/chen/registration/confirm', headers=first_headers, json={'option_id':'project_a'}).is_success
+    for role, msg in [('chen', HELLO), ('wang', QUESTION), ('lin', LIN_ASK)]:
+        analysis, gen, audit = send(second, second_headers, role, msg, shared_id if role == 'chen' else None)
+        assert analysis['private_history'] == gen['private_history'] == audit['private_history'] == []
+        if role == 'chen':
+            assert not gen['permitted_facts'] and gen['registration']['availability'] == 'not_invited'
+            assert not gen['registration']['submitted'] and not analysis['registration']['invited']
+        else:
+            assert all('registration' not in payload for payload in (analysis, gen, audit))
+    for path, headers, role, expected in [(first, first_headers, 'chen', [INTEREST, INVITE, CHEN_ASK, CHEN_GAP]),
+                                          (second, second_headers, 'chen', [HELLO, TURNS[HELLO][1]])]:
+        for payload in send(path, headers, role, HELLO):
+            assert [m['text'] for m in payload['private_history']] == expected
+    assert client.get(second, headers=first_headers).status_code == 404
+    assert [m['role'] for m in client.get(first, headers=first_headers).json()['messages']] == ['chen']*6
+    assert not client.get(second, headers=second_headers).json()['registration']['submitted']
+
+
+def test_closed_app_reopens_the_same_complete_archive(tmp_path, monkeypatch):
+    monkeypatch.setenv('SCAMSENSE_DATABASE_URL', f'sqlite:///{(tmp_path / "restart.db").as_posix()}')
+    monkeypatch.setenv('OPENAI_API_KEY', '')
+    config = Config(str(ROOT / 'alembic.ini'))
+    command.upgrade(config, 'head')
+    with wire_fixture('/provider-root') as (base, calls):
+        monkeypatch.setenv('OPENAI_BASE_URL', base)
+        with TestClient(create_app()) as client:
+            session = client.post('/api/sessions').json()
+            path, hdr = '/api/sessions/'+session['id'], {'Authorization':'Bearer '+session['token']}
+            for role, msg in [('wang', QUESTION), ('chen', INTEREST), ('chen', MIXED), ('lin', LIN_ASK)]:
+                turn = {'role':role, 'text':msg, 'request_id':str(uuid4())}
+                assert 'event: done' in client.post(path+'/turns', headers=hdr, json=turn).text
+            for _ in range(2):
+                r = client.post(path+'/contacts/chen/registration/confirm', headers=hdr, json={'option_id':'project_a'})
+                assert r.is_success
+            active = client.get(path, headers=hdr).json()
+            assert len(active['messages']) == 8 and active['registration']['submitted'] == ['project_experience']
+            assert len([e for e in active['registration']['history'] if e['source']=='explicit']) == 1
+        command.upgrade(config, 'head')
+        with TestClient(create_app()) as restarted:
+            assert restarted.get(path, headers=hdr).json() == active
+            assert '"cached":true' in restarted.post(path+'/turns', headers=hdr, json=turn).text
+            ending = {'kind':'decision', 'choice':'necessary_only', 'reason':JUDGMENT, 'cited':[active['messages'][1]['id']]}
+            report = restarted.post(path+'/finish', headers=hdr, json=ending).json()
+            assert [e['focus'] for e in report['disclosures']] == ['K05', 'K04']
+            archived = restarted.get(path, headers=hdr).json()
+            assert archived['review'] == report and archived['closed']
+    # Reading the archive and replaying completed operations needs no provider.
+    monkeypatch.delenv('OPENAI_BASE_URL')
+    with TestClient(create_app()) as offline:
+        assert offline.get(path, headers=hdr).json() == archived
+        assert offline.post(path+'/finish', headers=hdr, json=ending).json() == report
+        assert '"cached":true' in offline.post(path+'/turns', headers=hdr, json=turn).text
+    assert len(calls) == 12
 
 
 def test_model_receives_only_the_active_role_card(wired_session):

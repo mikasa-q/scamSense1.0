@@ -272,6 +272,84 @@ def test_k04_retelling_cannot_unlock_a_fact_or_become_user_judgment(lab, reply_u
     assert not report['disclosures'] and not any(d['evidence'] for d in report['dimensions'])
 
 
+@pytest.mark.parametrize('disclose_again', [False, True], ids=['continue-and-finish', 'new-route'])
+def test_pre_k04_excerpt_neither_grants_permission_nor_enters_new_review(lab, disclose_again):
+    from backend.db import Message
+    question, old_body = '能从哪里独立核对？', '我们一般用官方邮箱发通知。'
+    factory = lab.app.state.factory
+    with factory.begin() as db:
+        receipt = Receipt(sid=lab.sid, request_id=str(uuid4()), fingerprint=training.digest('lin\0' + question),
+                          attempt=uuid4().hex, status='done')
+        db.add(receipt); db.flush()
+        user, lin = [Message(sid=lab.sid, receipt=receipt.id, role='lin', speaker=speaker, body=body)
+                     for speaker, body in [('user', question), ('assistant', old_body)]]
+        db.add_all([user, lin]); db.flush()
+        db.add_all([Trace(sid=lab.sid, message_id=user.id, kind='verify_official', focus='K04', quote=question, why='核实提问'),
+                    Trace(sid=lab.sid, message_id=lin.id, kind='disclosure', focus='K04', quote='官方邮箱', why='角色披露'),
+                    StoryEvent(sid=lab.sid, message_id=user.id, stage=4, kind='verify_official')])
+        db.get(Training, lab.sid).stage = 4
+    lab.model.actions, lab.model.body = [], '可以继续聊。'
+    assert 'event: done' in lab.post('你好。', 'lin').text
+    assert lab.model.calls[-2][2] == [{'speaker':'user','text':question}, {'speaker':'assistant','text':old_body}]
+    assert lab.model.calls[-2][3] == {} and lab.model.calls[-1][3] == {}
+    expected = []
+    if disclose_again:
+        lab.model.actions = [action('verify_official', 'K04', question)]
+        lab.model.body, lab.model.k04 = '请通过公司公开招聘渠道核对我负责的面试。', 'k04_interview_route'
+        assert 'event: done' in lab.post(question, 'lin').text
+        assert training.private_context(factory, lab.sid, 'lin')[1] == {'K04'}
+        expected.append((lab.snap()['messages'][-1]['id'], lab.model.body))
+    report = lab.end(kind='early').json()
+    assert [(e['message_id'], e['quote']) for e in report['disclosures']] == expected
+    assert report_dims(report)['verify']['evidence'][0]['message_id'] == user.id
+    assert lab.snap()['messages'][1]['body'] == old_body
+    with factory() as db:
+        trace = db.scalars(select(Trace).where(Trace.message_id == lin.id)).one()
+        assert (trace.focus, trace.kind, trace.quote) == ('K04', 'disclosure', '官方邮箱')
+
+
+def test_archived_k04_report_is_read_as_saved_not_reclassified(lab):
+    from backend.db import Review
+    body = '我们一般用官方邮箱发通知。'
+    lab.model.actions, lab.model.body = [], body
+    assert 'event: done' in lab.post('平时怎样联系？', 'lin').text
+    mid = lab.snap()['messages'][-1]['id']
+    original = lab.end(kind='early').json()
+    ref = dict(role='lin', speaker='assistant', message_id=mid, focus='K04', topic='可独立核对的官方依据',
+               quote='官方邮箱', why='这段角色原话实际披露了该事实；不计作你的识别证据。')
+    original.update(rubric='evidence-only-v1', disclosures=[ref])
+    with lab.app.state.factory.begin() as db:
+        db.add(Trace(sid=lab.sid, message_id=mid, kind='disclosure', focus='K04', quote=ref['quote'], why=ref['why']))
+        review = db.get(Review, lab.sid)
+        review.rubric, review.payload = original['rubric'], original
+    calls = len(lab.model.calls)
+    assert lab.snap()['review'] == lab.end(kind='early').json() == original
+    assert len(lab.model.calls) == calls
+    with lab.app.state.factory() as db:
+        assert db.get(Review, lab.sid).payload == original
+
+
+@pytest.mark.parametrize(('focus', 'kind', 'question', 'answer'), [
+    ('K01', 'ask_employer', '能出示企业的招聘授权吗？', '我不能出示可独立核对的企业招聘授权。'),
+    ('K02', 'ask_data', '为什么初筛要收简历以外的资料？', '说是汇总意向和安排面试，但我说不清初筛为什么要这些资料。'),
+    ('K03', 'ask_data', '谁接收资料、保存多久，会交给第三方吗？', '资料的实际接收方、保存期限和第三方处理方式，我都说不清。'),
+])
+def test_consultant_question_is_not_a_disclosure_or_a_user_judgment(lab, focus, kind, question, answer):
+    lab.model.actions = [action(kind, focus, question)]
+    lab.model.body = '这方面我们之后再聊。'
+    assert 'event: done' in lab.post(question, 'chen').text
+    assert not training.private_context(lab.app.state.factory, lab.sid, 'chen')[1]
+    lab.model.body, lab.model.disclosures = answer, [Disclosure(focus=focus, quote=answer)]
+    assert 'event: done' in lab.post(question, 'chen').text
+    msgs = lab.snap()['messages']
+    report = lab.end(kind='early').json()
+    ref, = report['disclosures']
+    assert (ref['focus'], ref['speaker'], ref['message_id'], ref['quote']) == (focus, 'assistant', msgs[3]['id'], answer)
+    dims = report_dims(report)
+    assert [e['message_id'] for e in dims['verify']['evidence']] == [msgs[0]['id'], msgs[2]['id']]
+    assert not dims['risk']['evidence'] and not dims['sources']['evidence']
+
+
 def test_role_and_session_isolation(lab):
     lab.post()
     lab.model.body, lab.model.actions, lab.model.disclosures = '我只了解自己负责的招聘。', [], []
@@ -340,6 +418,18 @@ def test_privacy_rejects_before_receipt_or_model(lab, value):
     assert lab.end(kind='decision',choice='verify',reason=value).status_code == 422
     assert not lab.model.calls and not lab.snap()['messages']
     with lab.app.state.factory() as db: assert not list(db.scalars(select(Receipt.id)))
+
+def test_failure_diagnostics_do_not_expose_chat_or_token(lab, caplog):
+    from sqlalchemy import exc, text
+    private = '这是仅用于验证日志边界的一段虚构草稿。'
+    lab.model.break_at = 'reply'
+    with caplog.at_level('INFO'):
+        assert 'event: error' in lab.post(private).text
+    assert private not in caplog.text and lab.hdr['Authorization'].split()[1] not in caplog.text
+    with lab.app.state.engine.connect() as conn, pytest.raises(exc.DBAPIError) as failure:
+        conn.execute(text('SELECT :draft FROM absent_test_table'), {'draft':private})
+    assert private not in str(failure.value)
+
 
 def test_unconfigured_is_explicit_and_server_does_not_offer_fake_mode(lab):
     lab.model.configured = False

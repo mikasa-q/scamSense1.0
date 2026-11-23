@@ -7,7 +7,7 @@ export type Role = keyof typeof roles
 export const keys: Role[] = ['lin','chen','wang']
 export const stages = ['初始接触','了解机会','候选人预登记','风险线索出现','主动验证','最终决策','训练复盘']
 export const scene = '群聊里的实习机会'
-export interface Msg { id:number; role:Role; speaker:'user'|'assistant'; body:string; created:string }
+export interface Msg { id:number; request_id:string; role:Role; speaker:'user'|'assistant'; body:string; created:string }
 export interface RefQuote {role:Role; speaker:'user'|'assistant'; message_id:number; focus:string; topic:string; quote:string; why:string}
 export interface Dimension {key:string; label:string; weight:number; score:number|null; status:'insufficient'|'pending'; evidence:RefQuote[]}
 export type FieldKey = 'project_experience'|'city'

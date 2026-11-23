@@ -1,14 +1,14 @@
 from sqlalchemy import select
-from .db import Message, Trace
+from .db import Message, Trace, evidence_rows
 from .policy import ASKS, DISCLOSURE_KINDS, FOCI, K04_TOPICS
 from .registration import LEGACY_ITEMS, registration_snapshot
 
-RUBRIC = 'evidence-only-v1'
+RUBRIC = 'evidence-only-v2'
 CHOICES = {'verify':'先核实再决定', 'leave':'退出招聘流程', 'continue':'继续了解机会', 'necessary_only':'仅提交必要资料'}
 DIMS = [('risk','风险识别',25), ('verify','主动核实',30), ('decision','决策合理性',25), ('sources','证据分析',20)]
 
-def message_dict(m):
-    return dict(id=m.id, role=m.role, speaker=m.speaker, body=m.body, created=m.created)
+def message_dict(m, request_id):
+    return dict(id=m.id, role=m.role, speaker=m.speaker, body=m.body, created=m.created, request_id=request_id)
 
 def ending_dict(e):
     return dict(kind=e.kind, choice=e.choice, label=CHOICES.get(e.choice, '提前结束训练'), reason=e.reason, cited=e.cited, created=e.created)
@@ -25,7 +25,7 @@ def saved_review(review):
 
 
 def make_review(db, sid, ending):
-    rows = db.execute(select(Trace, Message).join(Message, Trace.message_id == Message.id).where(Trace.sid == sid).order_by(Trace.id)).all()
+    rows = db.execute(evidence_rows(sid).order_by(Trace.id)).all()
     groups = {key: [] for key, _, _ in DIMS}
     disclosures = []
     for t, m in rows:

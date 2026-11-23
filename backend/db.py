@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, text
+from sqlalchemy import JSON, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +17,7 @@ def database_url():
     return f'sqlite:///{(folder / "scamsense.sqlite3").as_posix()}'
 
 def engine_for(url):
-    engine = create_engine(url, connect_args={'check_same_thread': False, 'timeout': 10})
+    engine = create_engine(url, hide_parameters=True, connect_args={'check_same_thread': False, 'timeout': 10})
     @event.listens_for(engine, 'connect')
     def sqlite_constraints(conn, _record):
         conn.execute('PRAGMA foreign_keys=ON')
@@ -85,6 +85,12 @@ class Trace(Base):
     focus: Mapped[str] = mapped_column(String(12))
     quote: Mapped[str] = mapped_column(Text)
     why: Mapped[str] = mapped_column(Text)
+
+def evidence_rows(sid):
+    # Pre-K04 topic excerpts are historical traces, not audited disclosures.
+    legacy_excerpt = (Trace.focus == 'K04') & (Trace.kind == 'disclosure')
+    return (select(Trace, Message).join(Message, Trace.message_id == Message.id)
+            .where(Trace.sid == sid, Message.sid == sid, ~legacy_excerpt))
 
 class RegistrationEntry(Base):
     __tablename__ = 'registration_entries'

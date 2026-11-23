@@ -11,7 +11,12 @@
 py -3.13 run.py --setup
 ```
 
-首次会联网安装依赖、构建页面、迁移本地数据库，然后启动 `http://127.0.0.1:8765`。以后直接 `py -3.13 run.py`，Ctrl+C 停止。macOS / Linux 可将 `py -3.13` 替换为 `python3`。
+从干净 checkout 的仓库根目录运行即可。首次会建 `.venv`、从 `requirements.txt` 和前端锁文件安装依赖、类型检查及构建 `frontend/dist`、执行 `alembic upgrade head`，再启动同源服务。用浏览器打开 **http://127.0.0.1:8765**，不是双击 `dist/index.html`。以后直接 `py -3.13 run.py`；Ctrl+C 停止。macOS / Linux 将 `py -3.13` 替换为 `python3`。
+
+数据库默认在 `data/scamsense.sqlite3`，不要随发布目录删除；已有库先备份再启动。重启后用**同一浏览器、同一来源（含端口）**打开「训练记录」。后端保留消息、登记和复盘，浏览器本地只保存训练索引及访问凭据；待确认的发言草稿与请求编号临时放在当前标签页，按场次和联系人隔离，确认完成后清除。不要分享浏览器存储。清掉凭据后，单靠训练链接不能恢复访问。
+
+- [3–5 分钟现场演示／可选真模型冒烟清单](docs/demo.md)
+- [CVM 生产配置、同源或独立前端、SQLite 备份与恢复](docs/deploy.md)
 
 ## 真实对话配置
 
@@ -20,7 +25,7 @@ py -3.13 run.py --setup
 | 环境变量 | 含义 |
 | --- | --- |
 | `OPENAI_API_KEY` | 远程模型的服务端密钥。默认调用 OpenAI。如使用本机回环地址的兼容模型，可不设密钥。 |
-| `OPENAI_BASE_URL` | OpenAI 兼容 API 根地址，包含 `/v1`，不包含 `/chat/completions`；远程必须用 HTTPS。 |
+| `OPENAI_BASE_URL` | 供应商给出的 Chat Completions API 根地址，不含 `/chat/completions`；应用只拼接这个端点。根地址是否包含 `/v1` 取决于服务商，远程必须用 HTTPS。 |
 | `OPENAI_MODEL` | 服务实际支持的模型 ID，默认 `gpt-4o-mini`；需支持 Chat Completions 的 `json_object` 输出。 |
 | `SCAMSENSE_DATABASE_URL` | 可选，SQLite 连接串；默认持久化到 `data/scamsense.sqlite3`，自定义路径须先创建父目录。 |
 
@@ -39,6 +44,32 @@ py -3.13 run.py --setup
 - `migrations/`：数据库迁移。`frontend/`：工作台、训练记录、三个私聊、终局与复盘。
 - `tests/`：临时 SQLite 与仅测试使用的模型替身。已安装依赖后运行 `.\.venv\Scripts\python.exe -m pytest -q`。前端类型检查及构建：`npm --prefix frontend run build`。
 - 前端热更新：先运行后端，再执行 `npm --prefix frontend run dev`；开发代理指向 8765。独立部署前端时可在**构建前**配置公开地址 `VITE_API_BASE_URL`（不含 `/api`），后端 `SCAMSENSE_WEB_ORIGIN` 配置允许的单一前端来源。当前交付仅为本地原型，未部署云资源。
+
+### 可复跑的浏览器验收（可选、只用测试替身）
+
+先完成 `run.py --setup`，退出本地服务也可运行。以下为 PowerShell 命令；测试只在回环地址启动临时 API、测试模型和独立 SQLite，不读取真实模型密钥。
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install 'playwright>=1.51,<2'
+.\.venv\Scripts\python.exe -m playwright install chromium
+npm --prefix frontend run build
+$env:SCAMSENSE_TEST_BROWSER='1'
+.\.venv\Scripts\python.exe -m pytest -q
+Remove-Item Env:SCAMSENSE_TEST_BROWSER
+```
+
+已有 Microsoft Edge 的机器可跳过 Chromium 下载，在同一终端设置 `$env:SCAMSENSE_BROWSER_CHANNEL='msedge'`。Linux/macOS 用 `.venv/bin/python` 和 `SCAMSENSE_TEST_BROWSER=1 .venv/bin/python -m pytest -q`。上述完整套件默认跳过真实供应商用例；真模型验收应单独走[应用冒烟清单](docs/demo.md)，不把测试替身当现场 AI。
+
+### 现场常见问题
+
+| 现象 | 怎么处理 |
+| --- | --- |
+| 没有可执行的 Python／npm、前端 404 | 核实 Python 和 Node 版本、安装 `venv` 支持；从仓库根目录重跑 `run.py --setup`，确认有 `frontend/dist/index.html`。 |
+| 端口占用／找不到上场 | `run.py --port 8766` 可换端口；回看旧场请用原来的协议、主机、端口和浏览器，并确认后端使用同一 SQLite 文件。|
+| 启动时报无法打开数据库 | 自定义 SQLite 路径先建父目录，保证运行账号可读写；不要新建空库冒充恢复。|
+| 后端在线但模型未配置／本轮失败 | `/api/health` 的 `model_configured` 是配置检查，不验证模型权限、余额、JSON 输出或联网。核对供应商根地址、模型名、授权和网络后重启；不贴密钥。只有实际完成应用私聊、审核和复盘，才算真模型验过。|
+| 发送时断线、刷新或模型超时 | 回到该场该角色，先等「正在处理」消失；只核对后端已存的消息。若仍无完成记录，保留原文点「发送」重试；不是新增一轮时不要改写重发。模型/校验失败不落半轮。非正常终止服务后，正在处理的锁最多约 200 秒到期。|
+| 登记按钮消失／确认时网络中断 | 核对陈浩已实际邀请、整单未停止且训练未结束。刷新看已提交项；未提交可再点同一选项，已提交不会增加第二条记录。重启登记不代提交。 |
 
 ## 未冻结的业务规则
 

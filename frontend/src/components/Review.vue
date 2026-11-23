@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import {ArrowRight, CornerDownLeft, Flag, Quote} from 'lucide-vue-next'
-import {dateText, roles, scene, statusText, submittedLabels, type Report, type RefQuote} from '../data'
-const props=defineProps<{report:Report;sid:string}>()
+import {dateText, roles, scene, statusText, submittedLabels, type Msg, type Report, type RefQuote} from '../data'
+const props=defineProps<{report:Report;sid:string;messages:Msg[]}>()
 const link=(ref:RefQuote)=>`#/chat/${props.sid}/${ref.role}?m=${ref.message_id}`
 </script>
-<template><div class="page-intro"><div class="eyebrow"><span></span> FIELD NOTES &nbsp;/&nbsp; CASE 001</div><h1>本场训练复盘</h1><p>{{scene}} · 从原话出发，区分角色透露的信息和你自己的判断。</p></div><div class="report-summary"><div class="eyebrow">SESSION OUTCOME</div><h2>{{report.ending.label}}</h2><p>{{report.ending.kind==='early'?'你结束了模拟，没有作正式招聘决定。':report.ending.reason || '你提交了正式选择，没有填写判断理由。'}}</p><small>综合分：{{report.total??'—'}} &nbsp; / &nbsp; 量表未定稿，不按缺失项重算总分。</small></div>
+<template><div class="page-intro"><div class="eyebrow"><span></span> FIELD NOTES &nbsp;/&nbsp; CASE 001</div><h1>本场训练复盘</h1><p>{{scene}} · 从原话出发，区分角色透露的信息和你自己的判断。</p></div><div class="report-summary"><div class="eyebrow">SESSION OUTCOME</div><h2>{{report.ending.label}}</h2><p>{{report.ending.kind==='early'?'你结束了模拟，没有作正式招聘决定。':report.ending.reason || '你提交了正式选择，没有填写判断理由。'}}</p><div v-if="report.ending.kind==='decision' && !report.ending.reason && report.ending.cited.length" class="ref-entry"><small>决定时引用（未填写判断理由）</small><div v-for="m in messages.filter(m=>report.ending.cited.includes(m.id))" :key="m.id"><blockquote>{{m.body}}</blockquote><a :href="`#/chat/${sid}/${m.role}?m=${m.id}`">定位原话 <CornerDownLeft :size="13"/></a></div></div><small>综合分：{{report.total??'—'}} &nbsp; / &nbsp; 量表未定稿，不按缺失项重算总分。</small></div>
+  <p v-if="report.rubric==='evidence-only-v1'" class="notice">历史复盘：保留结束训练时的证据，未按现行规则重新核验。</p>
   <section v-if="report.registration" class="desk-section" aria-label="登记复盘"><header class="section-head"><h2>陈浩的虚构预登记</h2></header><div class="panel clues">
     <h3>已提交项：{{submittedLabels(report.registration)}}</h3><p class="muted">同意提供、重启登记和终局决定都不算实际提交。</p>
     <p v-if="report.registration.declined_all">已停止整个登记。之前实际提交的记录仍然保留。</p>
