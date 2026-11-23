@@ -19,6 +19,19 @@ py -3.13 run.py --setup
 - [CVM 生产配置、同源或独立前端、SQLite 备份与恢复](docs/deploy.md)
 - [本次验收记录：本地、测试替身与未验证项](docs/verification.md)
 
+## 用 Docker 运行预览版
+
+镜像名为 `ghcr.io/mikasa-q/scamsense1.0`，平台为 `linux/amd64`。使用打包工作流报告中的完整 `preview-…` 标签或 `@sha256:…` 摘要，不使用 `latest`。若包尚未公开，拉取前需用有权限的 GitHub 账号登录 GHCR。
+
+也可以从打包分支自己构建。以下命令只向本机开放服务，SQLite 保存在命名卷中；使用已发布镜像时，跳过第一行，把第二行末尾的 `scamsense:local` 替换为完整镜像引用：
+
+```sh
+docker build -t scamsense:local .
+docker run -d --name scamsense -p 127.0.0.1:8765:8765 -v scamsense-data:/app/data scamsense:local
+```
+
+打开 **http://127.0.0.1:8765**。容器启动时会先迁移数据库；更新前备份数据卷，重建时沿用同一卷，不要删除它。镜像不含模型配置；需要真实对话时，在宿主机配置下列环境变量，在 `docker run` 的镜像名前加 `-e OPENAI_API_KEY -e OPENAI_BASE_URL -e OPENAI_MODEL`，不要把密钥写进镜像或命令行。
+
 ## 真实对话配置
 
 只在**后端进程环境**设置以下变量，然后重新启动后端。不要把密钥放进聊天、前端变量、源码或命令行参数。`OPENAI_API_KEY` 建议通过本机密钥管理或进程环境注入；不建议把明文密钥写入 shell 历史。

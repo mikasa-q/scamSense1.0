@@ -1,0 +1,17 @@
+**
+!requirements.txt
+!alembic.ini
+!backend/*.py
+!backend/role_cards.json
+!migrations/env.py
+!migrations/versions/*.py
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/index.html
+!frontend/tsconfig.json
+!frontend/vite.config.ts
+!frontend/public/fieldnote.html
+!frontend/src/*.ts
+!frontend/src/*.css
+!frontend/src/*.vue
+!frontend/src/components/*.vue

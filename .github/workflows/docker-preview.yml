@@ -1,0 +1,75 @@
+name: Docker preview
+
+on:
+  push:
+    branches: [packaging/docker-preview]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build the preview image
+        id: build
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:preview-${GITHUB_SHA:0:12}"
+          docker build --pull --platform linux/amd64 --tag "$image" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" .
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+
+      - name: Verify frontend, API, migrations and persistence
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+        shell: bash
+        run: |
+          volume=$(docker volume create)
+          trap 'docker rm -f preview-smoke >/dev/null 2>&1 || true; docker volume rm "$volume" >/dev/null' EXIT
+          start() {
+            docker run -d --name preview-smoke -p 127.0.0.1:8765:8765 -v "$volume:/app/data" "$IMAGE"
+            curl -fsS --retry 20 --retry-delay 1 --retry-connrefused --max-time 5 \
+              http://127.0.0.1:8765/api/health | python3 -c 'import json,sys; assert json.load(sys.stdin)["model_configured"] is False'
+          }
+          start
+          test "$(docker exec preview-smoke id -u)" = 10001
+          python3 - <<'PY'
+          import re
+          from urllib.request import urlopen
+          base = 'http://127.0.0.1:8765'
+          html = urlopen(base, timeout=5).read().decode()
+          assert '<title>ScamSense' in html
+          script = re.search(r'<script\b[^>]*\bsrc="(/assets/[^" ]+\.js)"', html)
+          assert script and 'javascript' in urlopen(base + script[1], timeout=5).headers.get_content_type()
+          PY
+          sid=$(curl -fsS --max-time 5 -X POST http://127.0.0.1:8765/api/sessions | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          docker stop preview-smoke && docker rm preview-smoke
+          start
+          docker exec -i preview-smoke python - "$sid" <<'PY'
+          import sqlite3, sys
+          with sqlite3.connect('file:/app/data/scamsense.sqlite3?mode=ro', uri=True) as db:
+              assert db.execute('SELECT count(*) FROM trainings WHERE id=?', (sys.argv[1],)).fetchone() == (1,)
+          PY
+
+      - name: Publish and verify the registry copy
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          expected=$(docker image inspect --format '{{.Id}}' "$IMAGE")
+          docker push "$IMAGE"
+          docker pull --platform linux/amd64 "$IMAGE"
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$expected"
+          ref=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          printf 'Verified %s (%s)\n' "$IMAGE" "$ref"
+          printf 'Pull: `docker pull %s`\n\nDigest: `%s`\n' "$IMAGE" "$ref" >> "$GITHUB_STEP_SUMMARY"
