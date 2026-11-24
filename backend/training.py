@@ -3,7 +3,7 @@ import secrets
 import time
 from fastapi import HTTPException
 from sqlalchemy import select
-from .db import Ending, Message, Receipt, RegistrationConfirmation, RegistrationEntry, Review, StoryEvent, Trace, Training, uid, writer
+from .db import Ending, Message, Receipt, RegistrationConfirmation, RegistrationEntry, Review, StoryEvent, Trace, Training, evidence_rows, uid, writer
 from .policy import ASKS, DISCLOSURE_KINDS, K04_BY_ROLE, REGISTRATION_ACTIONS, WHY, check_generated, permission, registration_turn, validate_actions, validate_registration_reply, validate_reply
 from .registration import CHAT_STATUSES, FIELDS, LEGACY_TRACE_KIND, OPTIONS, apply_legacy_refusal, availability, registration_controls, registration_log, registration_snapshot, registration_state, was_invited
 from .review import RUBRIC, make_review, message_dict, saved_review
@@ -61,11 +61,12 @@ def is_busy(s):
 def snapshot(factory, sid):
     with factory() as db:
         s = db.get(Training, sid)
-        messages = db.scalars(select(Message).where(Message.sid == sid).order_by(Message.id)).all()
+        messages = db.execute(select(Message, Receipt.request_id).join(Receipt, Message.receipt == Receipt.id)
+                              .where(Message.sid == sid, Receipt.sid == sid).order_by(Message.id)).all()
         review = db.get(Review, sid)
         return dict(id=s.id, created=s.created, stage=s.stage, closed=s.closed, busy=is_busy(s),
                     registered=was_invited(db, sid), registration=registration_snapshot(db, sid),
-                    messages=[message_dict(m) for m in messages], review=saved_review(review))
+                    messages=[message_dict(m, rid) for m, rid in messages], review=saved_review(review))
 
 def reserve(factory, sid, request_id, role, text, configured):
     fingerprint = digest(role + '\0' + text)
@@ -96,7 +97,8 @@ def private_context(factory, sid, role):
     with factory() as db:
         msgs = db.scalars(select(Message).where(Message.sid == sid, Message.role == role).order_by(Message.id.desc()).limit(24)).all()
         history = [{'speaker':m.speaker, 'text':m.body} for m in reversed(msgs)]
-        previous = set(db.scalars(select(Trace.focus).join(Message, Message.id == Trace.message_id).where(Trace.sid == sid, Trace.kind.in_(DISCLOSURE_KINDS), Message.role == role)))
+        previous = set(db.scalars(evidence_rows(sid).with_only_columns(Trace.focus).where(
+            Trace.kind.in_(DISCLOSURE_KINDS), Message.role == role, Message.speaker == 'assistant')))
         registration = None
         if role == 'chen':
             registration = registration_state(db, sid, registration_log(db, sid))
