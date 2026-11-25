@@ -17,20 +17,20 @@ py -3.13 run.py --setup
 
 - [3–5 分钟现场演示／可选真模型冒烟清单](docs/demo.md)
 - [CVM 生产配置、同源或独立前端、SQLite 备份与恢复](docs/deploy.md)
-- [本次验收记录：本地、测试替身与未验证项](docs/verification.md)
+- [2026-11-23 本地 MVP 验收记录：测试替身与未验证项](docs/verification.md)
 
 ## 用 Docker 运行预览版
 
-镜像名为 `ghcr.io/mikasa-q/scamsense1.0`，平台为 `linux/amd64`。使用打包工作流报告中的完整 `preview-…` 标签或 `@sha256:…` 摘要，不使用 `latest`。若包尚未公开，拉取前需用有权限的 GitHub 账号登录 GHCR。
-
-也可以从打包分支自己构建。以下命令只向本机开放服务，SQLite 保存在命名卷中；使用已发布镜像时，跳过第一行，把第二行末尾的 `scamsense:local` 替换为完整镜像引用：
+安装支持 Linux 容器的 Docker 后，在仓库根目录执行以下命令；宿主机不需要另装 Node.js 或 Python。镜像从源码构建，服务只向本机开放，SQLite 保存在 `scamsense-data` 命名卷中。GitHub 的打包检查不发布镜像。
 
 ```sh
 docker build -t scamsense:local .
 docker run -d --name scamsense -p 127.0.0.1:8765:8765 -v scamsense-data:/app/data scamsense:local
 ```
 
-打开 **http://127.0.0.1:8765**。容器启动时会先迁移数据库；更新前备份数据卷，重建时沿用同一卷，不要删除它。镜像不含模型配置；需要真实对话时，在宿主机配置下列环境变量，在 `docker run` 的镜像名前加 `-e OPENAI_API_KEY -e OPENAI_BASE_URL -e OPENAI_MODEL`，不要把密钥写进镜像或命令行。
+容器先迁移数据库，再启动服务。`docker ps` 显示 `healthy` 后，打开 **http://127.0.0.1:8765**。日常停用和续用分别执行 `docker stop scamsense`、`docker start scamsense`；更新前备份数据，重建时沿用原卷、原端口和浏览器，不要删除数据卷。默认不连接模型；如需真实对话，先在宿主机安全设置下节的模型变量，再在 `docker run` 的镜像名前加 `-e OPENAI_API_KEY -e OPENAI_BASE_URL -e OPENAI_MODEL`，不在命令里写密钥值。
+
+**复验数据是否保留：** 构建后，在有 Docker 和 Python 3.11+ 的机器上运行 `python3 tests/docker_preview.py scamsense:local`（Windows 用 `py -3.13` 替代 `python3`）。脚本只使用临时卷和随机本机端口：检查生产页面和迁移，提交一份决定，移除容器，再用新容器和原凭据读回整场复盘。验收结束会清理测试资源，不使用 `scamsense-data` 或真实模型。
 
 ## 真实对话配置
 
