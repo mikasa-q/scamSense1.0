@@ -8,5 +8,7 @@ __pycache__/
 data/
 node_modules/
 frontend/dist/
+frontend/dist-sites/
+frontend/.*.qoder.site
 *.tsbuildinfo
 .DS_Store

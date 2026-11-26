@@ -4,7 +4,7 @@ import {ArrowLeft, ArrowRight, ArrowUpRight, BookOpenText, Check, ChevronRight, 
 import Desk from './components/Desk.vue'
 import Chat from './components/Chat.vue'
 import Review from './components/Review.vue'
-import {createSession,getSession,health} from './api'
+import {captureInvitation,createSession,getSession,health} from './api'
 import {dateText,keys,scene,stages,type RecordItem,type Role,type Session} from './data'
 const titles={desk:'训练工作台',archive:'训练记录',sample:'示例复盘',guide:'训练指南',chat:'角色私聊',review:'训练复盘'} as const
 type Page=keyof typeof titles
@@ -12,6 +12,7 @@ function route() {
   const [path,query]=location.hash.slice(1).split('?');const [p,id,role]=(path||'/desk').split('/').filter(Boolean)
   return {page:(p && Object.hasOwn(titles,p)?p:'desk') as Page,id:id||'',role:keys.includes(role as Role)?role as Role:'wang' as Role,target:Number(new URLSearchParams(query).get('m')||0)}
 }
+const invited=ref(captureInvitation()), classroom=ref(false)
 const r=ref(route()), menu=ref(false), error=ref(''),loading=ref(false),starting=ref(false), config=ref<boolean|null>(null), session=ref<Session|null>(null)
 const storage='scamsense.archive.v1'
 function savedRecords():RecordItem[] {try {const value=JSON.parse(localStorage.getItem(storage)||'[]');return Array.isArray(value)?value.filter(x=>typeof x.id==='string'&&typeof x.token==='string'&&typeof x.created==='string'):[]}catch{return []}}
@@ -24,9 +25,9 @@ async function load(quiet=false) {const id=r.value.id,seq=++loadSeq;if(!quiet)er
   if(session.value?.id!==id)session.value=null;if(!quiet)loading.value=!session.value
   try {const s=await getSession(current.value);if(seq===loadSeq&&r.value.id===id){accept(s);if(r.value.page==='review'&&!s.closed)location.replace(`#/chat/${id}/wang`)}}
   catch(e) {if(seq===loadSeq)error.value=(e as Error).message}finally{if(seq===loadSeq)loading.value=false}}
-async function check(){try{config.value=(await health()).model_configured}catch{config.value=null}}
+async function check(){try{const h=await health();config.value=h.model_configured;classroom.value=h.invite_required}catch{config.value=null}}
 async function start(role:Role='wang',force=false) {if(starting.value)return;starting.value=true;error.value='';try {let item=force?undefined:latest.value;if(!item){const s=await createSession();item={...s,closed:false,count:0,stage:0};records.value.unshift(item)}location.hash=`/chat/${item.id}/${role}`}catch(e){error.value=(e as Error).message}finally{starting.value=false}}
-function routeChange(){const old=r.value;r.value=route();menu.value=false;error.value='';document.title=`${titles[r.value.page]} · ScamSense`;if(r.value.page!==old.page || r.value.id!==old.id){window.scrollTo(0,0);load()}if(r.value.page==='chat')check()}
+function routeChange(){invited.value=captureInvitation();const old=r.value;r.value=route();menu.value=false;error.value='';document.title=`${titles[r.value.page]} · ScamSense`;if(r.value.page!==old.page || r.value.id!==old.id){window.scrollTo(0,0);load()}if(r.value.page==='chat')check()}
 function stored(e:StorageEvent){if(e.key===storage){records.value=savedRecords();if(!current.value&&['chat','review'].includes(r.value.page))load()}}
 function documentFocus(){document.getElementById('main-content')?.focus()}
 function locationToReview(){location.hash=`/review/${r.value.id}`}
@@ -43,6 +44,7 @@ const guides=[{q:'这是用来判断真实招聘方的吗？',a:'不是。ScamSe
   <div class="nav-caption">WORKSPACE <i></i></div><nav><a v-for="n in nav" :key="n.page" :href="`#/${n.page}`" :class="{active:r.page===n.page || (n.page==='desk'&&r.page==='chat') || (n.page==='archive'&&r.page==='review')}" :aria-current="r.page===n.page?'page':undefined"><component :is="n.icon" :size="18"/>{{n.label}}</a></nav><div class="nav-caption second">RESOURCES <i></i></div><nav><a href="#/guide" :class="{active:r.page==='guide'}"><CircleHelp :size="18"/>训练指南</a></nav><div class="sidebar-end"><div class="privacy-symbol"><ShieldCheck :size="20"/></div><span><b>虚构情境训练</b><small>不使用真实个人资料</small></span></div></aside>
   <div class="workspace"><header class="topbar"><div><button class="mobile-menu icon-button" aria-label="展开导航" :aria-expanded="menu" @click="menu=true"><Menu :size="20"/></button><PanelLeft class="desktop-mark" :size="16"/><span class="crumb">训练空间</span><ChevronRight :size="13"/><b>{{titles[r.page]}}</b></div><span class="lab-status"><i></i> FIELD LAB <span>/</span> 校园版</span></header>
   <main id="main-content" tabindex="-1"><div v-if="error" class="notice global-error" role="alert"><div><b>暂时无法完成操作</b><p>{{error}}</p></div><button v-if="current" class="icon-button" aria-label="重试加载" @click="load()"><RefreshCw :size="16"/></button><button class="icon-button" aria-label="关闭提示" @click="error='' "><X :size="16"/></button></div>
+    <div v-if="classroom && r.page==='desk'" class="notice" role="status"><ShieldCheck :size="18"/><div><b>班级训练</b><p>{{invited?'已读取邀请。点击下方按钮进入自己的训练。':'新建训练请使用组织者发给你的班级邀请链接；已有训练仍可从训练记录进入。'}}</p><p>你的对话会交给模型服务处理，请只使用虚构资料。</p></div></div>
     <Desk v-if="r.page==='desk'" :resume="!!latest" :starting="starting" @start="start"/>
     <template v-else-if="r.page==='archive'"><div class="page-intro"><div class="eyebrow"><span></span> SESSION ARCHIVE</div><div class="title-line"><h1>训练记录</h1><button class="btn primary small" :disabled="starting" @click="start('wang',true)"><Plus :size="16"/>新建训练</button></div><p>继续未结束的练习，或回看已归档的判断依据。仅列出本浏览器的训练。</p></div><div v-if="!records.length" class="panel empty-state"><span class="empty-icon"><FolderClock :size="28"/></span><h2>还没有训练记录</h2><p>从一条校园群招聘消息开始，完成的对话会保存在这里。</p><button class="btn primary" :disabled="starting" @click="start()">开始第一场训练 <ArrowRight :size="16"/></button></div><div v-else class="archive-list"><a v-for="item in records" :key="item.id" :href="`#/${item.closed?'review':'chat'}/${item.id}${item.closed?'':'/wang'}`" class="archive-row panel"><span class="archive-icon"><FolderClock :size="21"/></span><span class="archive-info"><b>{{scene}}</b><small>{{dateText(item.created)}} · {{item.count}} 条消息</small></span><span class="stage-pill">{{item.closed?'已归档':stages[item.stage]}}</span><ChevronRight :size="16"/></a></div></template>
     <template v-else-if="r.page==='sample'"><iframe title="只读示例：核实转发消息的来源" class="sample-frame" src="./fieldnote.html?embed=1" :style="{height:sampleHeight+'px'}" @load="fitSample"></iframe></template>

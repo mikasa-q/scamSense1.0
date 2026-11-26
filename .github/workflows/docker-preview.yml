@@ -1,0 +1,31 @@
+name: Docker preview
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build the Linux preview image
+        run: docker build --pull --platform linux/amd64 --tag scamsense:preview .
+
+      - name: Run backend regression tests without external network access
+        run: |
+          docker run --rm --network none --mount "type=bind,src=$PWD/tests,dst=/app/tests,readonly" \
+            scamsense:preview python -m pytest -q -p no:cacheprovider tests
+
+      - name: Verify readiness, frontend, migrations and recovery after container replacement
+        run: python3 tests/docker_preview.py scamsense:preview

@@ -431,6 +431,74 @@ def test_failure_diagnostics_do_not_expose_chat_or_token(lab, caplog):
     assert private not in str(failure.value)
 
 
+@pytest.mark.parametrize(('failure', 'expected'), [
+    ('http', {'stage':'audit_api', 'exception_type':'HTTPStatusError', 'http_status':429}),
+    ('timeout', {'stage':'audit_api', 'exception_type':'ReadTimeout'}),
+    ('envelope_json', {'stage':'audit_json', 'exception_type':'JSONDecodeError', 'http_status':200, 'reason_code':'provider_envelope'}),
+    ('envelope_shape', {'stage':'audit_json', 'exception_type':'IndexError', 'http_status':200, 'reason_code':'provider_envelope'}),
+    ('content', {'stage':'audit_json', 'exception_type':'ValidationError', 'http_status':200, 'reason_code':'content_json_invalid'}),
+    ('schema', {'stage':'audit_json', 'exception_type':'ValidationError', 'http_status':200, 'reason_code':'schema_supported'}),
+    ('unsafe', {'stage':'local_rule', 'exception_type':'RuleRejected', 'reason_code':'audit_unsafe'}),
+    ('permission', {'stage':'local_rule', 'exception_type':'RuleRejected', 'reason_code':'k04_unverified'}),
+    ('save', {'stage':'database_save', 'exception_type':'OperationalError'}),
+    ('success', None),
+])
+def test_lin_diagnostics_at_real_boundaries(lab, monkeypatch, caplog, failure, expected):
+    import httpx
+    from sqlalchemy import event, exc
+    question = '这个岗位的正式招聘流程在哪里可以核对？'
+    raw, key = 'PRIVATE-PROVIDER-BODY', 'PRIVATE-TEST-CREDENTIAL'
+    body = '请通过公司公开招聘渠道核对我负责的面试。'
+    lab.model.actions, lab.model.body = [action('verify_official', 'K04', question)], body
+    monkeypatch.setenv('OPENAI_BASE_URL', 'http://127.0.0.1:1')
+    monkeypatch.setenv('OPENAI_API_KEY', key)
+    adapter = CompatibleModel()
+    lab.model.audit = adapter.audit
+    async def post(self, url, **kwargs):
+        request = httpx.Request('POST', url, headers=kwargs['headers'])
+        if failure == 'http': return httpx.Response(429, request=request, text=raw)
+        if failure == 'timeout': raise httpx.ReadTimeout(raw + key, request=request)
+        if failure == 'envelope_json': return httpx.Response(200, request=request, text=raw)
+        if failure == 'envelope_shape': return httpx.Response(200, request=request, json={'choices':[], 'raw':raw})
+        supported = raw if failure == 'schema' else [] if failure == 'permission' else [0]
+        audit = {'safe':failure != 'unsafe', 'supported':supported, 'k04':'k04_interview_route', 'disclosures':[], 'registration_quote':None}
+        content = raw if failure == 'content' else json.dumps(audit)
+        return httpx.Response(200, request=request, json={'choices':[{'message':{'content':content}}]})
+    monkeypatch.setattr(httpx.AsyncClient, 'post', post)
+    if failure == 'save':
+        @event.listens_for(lab.app.state.engine, 'before_cursor_execute')
+        def reject_traces(conn, cursor, statement, parameters, context, executemany):
+            if statement.startswith('INSERT INTO traces'):
+                raise exc.OperationalError(statement, parameters, RuntimeError(raw + key))
+    response = lab.post(question, 'lin')
+    records = [r for r in caplog.records if r.name == 'backend.diagnostics']
+    if expected is None:
+        assert not records and 'event: done' in response.text
+        assert [m['body'] for m in lab.snap()['messages']] == [question, body]
+        return
+    assert len(records) == 1 and json.loads(records[0].getMessage()) == expected
+    assert records[0].exc_info is None and records[0].stack_info is None
+    assert not any(s in caplog.text for s in (key, raw, question, body, lab.sid, lab.hdr['Authorization']))
+    assert 'event: error' in response.text and 'reason_code' not in response.text and 'event: done' not in response.text
+    snap = lab.snap()
+    assert not snap['messages'] and not snap['busy'] and snap['stage'] == 0
+    with lab.app.state.factory() as db:
+        assert db.scalar(select(Receipt.status)) == 'failed'
+        assert list(db.scalars(select(StoryEvent.kind))) == ['created'] and not list(db.scalars(select(Trace.id)))
+
+
+def test_cleanup_does_not_mask_first_failure_or_leak(lab, monkeypatch, caplog):
+    lab.model.break_at = 'analysis'
+    def broken_cleanup(*args):
+        raise RuntimeError('PRIVATE-CLEANUP-DATA')
+    monkeypatch.setattr(training, 'fail_turn', broken_cleanup)
+    assert '本轮状态暂不可读' in lab.post().text
+    assert 'PRIVATE-CLEANUP-DATA' not in caplog.text
+    assert [json.loads(r.getMessage()) for r in caplog.records if r.name == 'backend.diagnostics'] == [
+        {'stage':'analysis_api', 'exception_type':'RuntimeError'},
+        {'stage':'database_cleanup', 'exception_type':'RuntimeError'}]
+
+
 def test_unconfigured_is_explicit_and_server_does_not_offer_fake_mode(lab):
     lab.model.configured = False
     assert lab.client.get('/api/health').json()['model_configured'] is False

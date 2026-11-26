@@ -4,6 +4,7 @@ import time
 from fastapi import HTTPException
 from sqlalchemy import select
 from .db import Ending, Message, Receipt, RegistrationConfirmation, RegistrationEntry, Review, StoryEvent, Trace, Training, evidence_rows, uid, writer
+from .diagnostics import Rule, RuleRejected, log_turn_failure
 from .policy import ASKS, DISCLOSURE_KINDS, K04_BY_ROLE, REGISTRATION_ACTIONS, WHY, check_generated, permission, registration_turn, validate_actions, validate_registration_reply, validate_reply
 from .registration import CHAT_STATUSES, FIELDS, LEGACY_TRACE_KIND, OPTIONS, apply_legacy_refusal, availability, registration_controls, registration_log, registration_snapshot, registration_state, was_invited
 from .review import RUBRIC, make_review, message_dict, saved_review
@@ -12,12 +13,14 @@ from .review import RUBRIC, make_review, message_dict, saved_review
 def digest(value):
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
-def create(factory):
+def create(factory, classroom=None):
     token = secrets.token_urlsafe(32)
     with writer(factory) as db:
         s = Training(token_hash=digest(token))
         db.add(s)
         db.flush()
+        if classroom is not None:
+            classroom.add_seat(db, s.id)
         db.add(StoryEvent(sid=s.id, kind='created', stage=0))
         return dict(id=s.id, token=token, created=s.created)
 
@@ -68,7 +71,7 @@ def snapshot(factory, sid):
                     registered=was_invited(db, sid), registration=registration_snapshot(db, sid),
                     messages=[message_dict(m, rid) for m, rid in messages], review=saved_review(review))
 
-def reserve(factory, sid, request_id, role, text, configured):
+def reserve(factory, sid, request_id, role, text, configured, classroom=None):
     fingerprint = digest(role + '\0' + text)
     with writer(factory) as db:
         s = db.get(Training, sid)
@@ -83,6 +86,8 @@ def reserve(factory, sid, request_id, role, text, configured):
             raise HTTPException(409, '本场有发言正在处理，请稍后刷新查看。')
         if not configured:
             raise HTTPException(503, '尚未连接对话模型。请在后端配置模型后重试；本轮未写入。')
+        if classroom is not None:
+            classroom.reserve_turn(db, sid)
         attempt = uid()
         s.locked_by, s.lock_until = attempt, int(time.time()) + 200
         if r:
@@ -116,7 +121,7 @@ def store_turn(factory, sid, rid, attempt, role, text, body, actions, disclosed,
     with writer(factory) as db:
         s, receipt = db.get(Training, sid), db.get(Receipt, rid)
         if s.closed or s.locked_by != attempt or receipt.attempt != attempt or not is_busy(s):
-            raise ValueError('stale attempt')
+            raise RuleRejected(Rule.stale_attempt)
         for trace_id, scope in legacy_scopes.items():
             if scope != 'uncertain':
                 trace = db.get(Trace, trace_id)
@@ -134,7 +139,7 @@ def store_turn(factory, sid, rid, attempt, role, text, body, actions, disclosed,
                 emitted.add(kind)
             if a.kind == 'respond_registration':
                 if a.status not in CHAT_STATUSES:
-                    raise ValueError('chat can only record willingness')
+                    raise RuleRejected(Rule.chat_willingness_only)
                 db.add(RegistrationEntry(sid=sid, message_id=user.id, reply_id=reply.id,
                                          field=a.field, status=a.status, quote=a.quote, position=a.position))
             if a.kind in WHY:
@@ -159,17 +164,20 @@ def fail_turn(factory, sid, rid, attempt):
 
 async def run_turn(factory, model, sid, reservation, role, text, progress):
     rid, attempt = reservation
+    stage = 'database_read'
     try:
         history, previous, registration = private_context(factory, sid, role)
         registered = registration is not None and registration['invited']
         progress('正在理解你的发言')
+        stage = 'analysis_api'
         analysis = await model.analyze(role, history, text, registration)
+        stage = 'turn_processing'
         actions = validate_actions(analysis, text, role, registered)
         legacy_scopes = {}
         if registration and (pending := registration.get('legacy_declines')):
             legacy_scopes = analysis.legacy_scopes
             if set(legacy_scopes) != {row['id'] for row in pending}:
-                raise ValueError('legacy refusal evidence was not fully classified')
+                raise RuleRejected(Rule.legacy_scope_incomplete)
             registration['scope_pending'] = 'uncertain' in legacy_scopes.values()
             registration['declined_all'] = 'whole' in legacy_scopes.values()
             for row in pending:
@@ -188,23 +196,33 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
             if pending := registration.get('legacy_declines'):
                 context['legacy_declines'] = pending
         progress('联系人正在组织回复')
+        stage = 'reply_api'
         reply = await model.reply(role, history, text, facts, invite, context)
+        stage = 'turn_processing'
         check_generated(reply.body)
         progress('正在核对本轮事实与原文')
+        stage = 'audit_api'
         audit = await model.audit(role, history, text, facts, invite, actions, reply.body, context)
+        stage = 'turn_processing'
         body, valid, disclosed, reg = validate_reply(reply, audit, actions, facts, previous, invite, role=role)
         if plan is not None:
             if audit.legacy_scopes != legacy_scopes:
-                raise ValueError('legacy refusal scope not independently confirmed')
+                raise RuleRejected(Rule.legacy_scope_disagreement)
             audited = registration_turn(registration, valid)
             if audited != plan:
-                raise ValueError('audited registration differs from the context used to generate the reply')
+                raise RuleRejected(Rule.registration_plan_mismatch)
             validate_registration_reply(audit, audited, reg, registration['submitted'])
             valid = [a for a in valid if a.kind not in REGISTRATION_ACTIONS or a in audited.this_turn]
+        stage = 'database_save'
         store_turn(factory, sid, rid, attempt, role, text, body, valid, disclosed, reg, registered, legacy_scopes)
         return True
-    except Exception:
-        fail_turn(factory, sid, rid, attempt)
+    except Exception as exc:
+        log_turn_failure(stage, exc)
+        try:
+            fail_turn(factory, sid, rid, attempt)
+        except Exception as cleanup_error:
+            log_turn_failure('database_cleanup', cleanup_error)
+            raise
         return False
 
 def finish(factory, sid, kind, choice, reason, cited):

@@ -41,12 +41,17 @@ def running_api(app):
 
 
 @pytest.fixture
-def ui(tmp_path, monkeypatch):
+def ui(tmp_path, monkeypatch, request):
     from playwright.sync_api import sync_playwright
     assert (ROOT / 'frontend/dist/index.html').is_file(), 'Build the frontend before running browser tests.'
     monkeypatch.setenv('SCAMSENSE_DATABASE_URL', f'sqlite:///{(tmp_path / "ui.db").as_posix()}')
     monkeypatch.setenv('OPENAI_API_KEY', '')
     monkeypatch.setenv('OPENAI_MODEL', 'wire-test-only')
+    invite = getattr(request, 'param', None)
+    if invite:
+        monkeypatch.setenv('SCAMSENSE_ACCESS_MODE', 'classroom')
+        monkeypatch.setenv('SCAMSENSE_CLASS_INVITE', invite)
+        monkeypatch.setenv('SCAMSENSE_MAX_TURNS', '1')
     command.upgrade(Config(str(ROOT / 'alembic.ini')), 'head')
     with wire_fixture() as (base, calls), sync_playwright() as pw:
         monkeypatch.setenv('OPENAI_BASE_URL', base)
@@ -57,10 +62,11 @@ def ui(tmp_path, monkeypatch):
             errors = []
             page.on('pageerror', lambda e: errors.append(type(e).__name__))
             page.goto(url)
-            page.get_by_role('button', name='进入训练').click()
-            page.locator('#message').wait_for()
+            if not invite:
+                page.get_by_role('button', name='进入训练').click()
+                page.locator('#message').wait_for()
             try:
-                yield SimpleNamespace(page=page, url=url, calls=calls, factory=app.state.factory)
+                yield SimpleNamespace(page=page, url=url, calls=calls, factory=app.state.factory, invite=invite)
             finally:
                 browser.close()
             assert not errors
@@ -81,6 +87,49 @@ def archive_new(page):
 def counts(ui, sid):
     with ui.factory() as db:
         return tuple(db.scalar(select(func.count()).select_from(t).where(t.sid == sid)) for t in (Receipt, StoryEvent, Trace))
+
+
+@pytest.mark.parametrize('ui', ['classroom-only-test-invitation-with+slash/and=padding'], indirect=True)
+def test_shared_invite_creates_private_training_and_removes_fragment(ui):
+    from playwright.sync_api import expect
+    p = ui.page
+    start = p.get_by_role('button', name='进入训练')
+    start.click()
+    expect(p.get_by_role('alert')).to_contain_text('有效邀请')
+    requests = []
+    p.on('request', lambda req: requests.append(req.url))
+    p.goto(ui.url + '/#invite=' + ui.invite)
+    expect(p.get_by_role('status')).to_contain_text('已读取邀请')
+    assert p.url == ui.url + '/#/desk'
+    p.reload()
+    expect(p.get_by_role('status')).to_contain_text('已读取邀请')
+    start.click()
+    send(p, QUESTION)
+    expect(p.locator('.message.assistant p')).to_have_text(REPLY)
+    first_url = p.url
+    assert ui.invite not in p.evaluate('JSON.stringify(localStorage)')
+    assert not any(ui.invite in url for url in requests)
+    assert len(ui.calls) == 3
+
+    other = p.context.browser.new_context()
+    try:
+        peer = other.new_page()
+        peer.goto(first_url)
+        expect(peer.get_by_role('alert')).to_contain_text('没有这场训练的访问凭据')
+        peer.goto(ui.url + '/#invite=' + ui.invite)
+        peer.get_by_role('button', name='进入训练').click()
+        peer.locator('#message').fill(QUESTION)
+        assert peer.url != first_url
+        peer.get_by_role('button', name='发送', exact=True).click()
+        expect(peer.get_by_role('alert')).to_contain_text('全班的对话额度已用完')
+        assert len(ui.calls) == 3
+    finally:
+        other.close()
+    p.reload()
+    expect(p.locator('.message.assistant p')).to_have_text(REPLY)
+    p.get_by_role('button', name='提前结束训练').click()
+    p.get_by_role('button', name='结束并查看复盘').click()
+    expect(p.get_by_text('你结束了模拟，没有作正式招聘决定。')).to_be_visible()
 
 
 def test_three_contacts_confirmation_decision_and_early_end(ui):

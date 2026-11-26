@@ -1,16 +1,32 @@
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import os
 from pathlib import Path
+import sqlite3
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import JSON, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 ROOT = Path(__file__).resolve().parents[1]
 
 def database_url():
-    if url := os.getenv('SCAMSENSE_DATABASE_URL'):
+    url = os.getenv('SCAMSENSE_DATABASE_URL')
+    if os.getenv('RAILWAY_PROJECT_ID'):
+        mount = Path(os.getenv('RAILWAY_VOLUME_MOUNT_PATH') or '.')
+        if not url or not mount.is_absolute() or not mount.is_dir():
+            raise ValueError('Railway 更新须指定原持久卷及其现有 SQLite 连接串。')
+        parsed = make_url(url)
+        path = Path(parsed.database or '.')
+        if (parsed.drivername != 'sqlite' or parsed.host or parsed.query or not path.is_absolute()
+                or not path.resolve().is_relative_to(mount.resolve()) or not path.is_file()):
+            raise ValueError('拒绝迁移：数据库必须是原持久卷上已存在的 SQLite 文件。')
+        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+            tables = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trainings','alembic_version')").fetchall()
+        if len(tables) != 2:
+            raise ValueError('拒绝迁移：指定的文件不是已有的 ScamSense 数据库。')
+    if url:
         return url
     folder = ROOT / 'data'
     folder.mkdir(exist_ok=True)
@@ -47,6 +63,11 @@ class Training(Base):
     closed: Mapped[bool] = mapped_column(default=False)
     locked_by: Mapped[str | None] = mapped_column(String(32))
     lock_until: Mapped[int] = mapped_column(Integer, default=0)
+
+class ClassroomSeat(Base):
+    __tablename__ = 'classroom_seats'
+    sid: Mapped[str] = mapped_column(ForeignKey('trainings.id'), primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer)
 
 class Receipt(Base):
     __tablename__ = 'receipts'

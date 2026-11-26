@@ -1,6 +1,24 @@
 import type {EndForm,OptionId,RecordItem,Report,Role,Session} from './data'
 const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/,'') + '/api'
 const auth = (r:RecordItem) => ({Authorization:`Bearer ${r.token}`})
+const inviteKey = 'scamsense.class-invite.v1'
+let invitation = ''
+try { invitation = sessionStorage.getItem(inviteKey) || '' } catch { /* Storage can be disabled. */ }
+export function captureInvitation():boolean {
+  const prefix = '#invite='
+  if (location.hash.startsWith(prefix)) {
+    const encoded = location.hash.slice(prefix.length)
+    history.replaceState(history.state, '', '#/desk')
+    let value = ''
+    try { value = decodeURIComponent(encoded) } catch { /* A malformed link grants no access. */ }
+    invitation = /^[A-Za-z0-9_+/=-]{32,128}$/.test(value) ? value : ''
+    try {
+      if (invitation) sessionStorage.setItem(inviteKey, invitation)
+      else sessionStorage.removeItem(inviteKey)
+    } catch { /* Keep the invitation in memory for this page. */ }
+  }
+  return Boolean(invitation)
+}
 async function checked(path:string, init?:RequestInit) {
   let res:Response
   try { res = await fetch(base + path, {cache:'no-store', signal:AbortSignal.timeout(15000), ...init}) }
@@ -11,8 +29,10 @@ async function checked(path:string, init?:RequestInit) {
   }
   return res
 }
-export const health = async ():Promise<{model_configured:boolean}> => (await checked('/health')).json()
-export const createSession = async ():Promise<Pick<RecordItem,'id'|'token'|'created'>> => (await checked('/sessions',{method:'POST'})).json()
+export const health = async ():Promise<{model_configured:boolean; invite_required:boolean}> => (await checked('/health')).json()
+export const createSession = async ():Promise<Pick<RecordItem,'id'|'token'|'created'>> => (await checked('/sessions',{
+  method:'POST', redirect:'error', headers:invitation ? {Authorization:`Bearer ${invitation}`} : {},
+})).json()
 export const getSession = async (r:RecordItem):Promise<Session> => (await checked(`/sessions/${r.id}`,{headers:auth(r)})).json()
 export const finishSession = async (r:RecordItem, end:EndForm):Promise<Report> => (await checked(`/sessions/${r.id}/finish`,{method:'POST',headers:{...auth(r),'Content-Type':'application/json'},body:JSON.stringify(end)})).json()
 export const confirmRegistration = async (r:RecordItem, option:OptionId):Promise<Session> =>
