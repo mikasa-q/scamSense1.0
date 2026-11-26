@@ -20,7 +20,6 @@ RUN groupadd --gid 10001 scamsense \
     && useradd --uid 10001 --gid 10001 --no-create-home --no-log-init scamsense \
     && install -d -o 10001 -g 10001 -m 0700 /app/data
 USER 10001:10001
-VOLUME ["/app/data"]
 EXPOSE 8765
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8765/api/health', timeout=3).close()"]
-CMD ["sh", "-c", "python -m alembic upgrade head && exec python -m uvicorn backend.main:create_app --factory --host 0.0.0.0 --port 8765 --no-access-log"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["python", "-c", "import os; from urllib.request import urlopen; port = int(os.getenv('PORT', '8765')); urlopen(f'http://127.0.0.1:{port}/api/health', timeout=3).close()"]
+CMD ["python", "-m", "backend.main"]

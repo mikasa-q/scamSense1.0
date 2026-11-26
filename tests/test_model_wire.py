@@ -11,7 +11,7 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from backend.db import ROOT
 from backend.main import create_app
-from backend.model import AUDIT, CHEN_AUDIT, CHEN_GENERATE, CHEN_INTERPRET, GENERATE, INTERPRET, K05_ACTIONS, K05_AUDIT, K05_INTERPRET, CompatibleModel
+from backend.model import LIN_AUDIT, CHEN_AUDIT, CHEN_GENERATE, CHEN_INTERPRET, GENERATE, INTERPRET, K05_ACTIONS, K05_AUDIT, K05_INTERPRET, CompatibleModel
 from backend.policy import Action, FACTS, Reply, k05_parts, validate_reply
 
 QUESTION = '这机会你亲自问过招聘方吗？'
@@ -82,7 +82,7 @@ def wire_fixture(api_root='/v1'):
                 result = {'actions':[p if isinstance(p, dict) else {'kind':p[0],'focus':p[1],'quote':msg,'source':'own'} for p in pairs]}
             elif system in (GENERATE, CHEN_GENERATE):
                 result = {'body':reply}
-            elif system in (AUDIT, K05_AUDIT, CHEN_AUDIT):
+            elif system in (LIN_AUDIT, K05_AUDIT, CHEN_AUDIT):
                 k04 = {LIN_ASK:'k04_interview_route', CHEN_ASK:'k04_missing_reference'}.get(msg, 'none')
                 result = {'safe':True,'k04':k04,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':None}
                 if system == CHEN_AUDIT:
@@ -327,7 +327,7 @@ def test_model_receives_only_the_active_role_card(wired_session):
             assert generation['registration']['this_turn'] == []
         else:
             assert all('registration' not in payload for payload in (analysis, generation, audit))
-        prompts = {'wang':[K05_INTERPRET,GENERATE,K05_AUDIT], 'chen':[CHEN_INTERPRET,CHEN_GENERATE,CHEN_AUDIT], 'lin':[INTERPRET,GENERATE,AUDIT]}[role]
+        prompts = {'wang':[K05_INTERPRET,GENERATE,K05_AUDIT], 'chen':[CHEN_INTERPRET,CHEN_GENERATE,CHEN_AUDIT], 'lin':[INTERPRET,GENERATE,LIN_AUDIT]}[role]
         assert [prompt for prompt,_ in calls[-3:]] == prompts
         assert analysis == expected_analysis
         assert ('reply_parts' in audit) == (role == 'wang')
@@ -338,6 +338,36 @@ def test_model_receives_only_the_active_role_card(wired_session):
         visible = json.dumps(generation, ensure_ascii=False)
         assert all(term in visible for term in expected)
         assert not any(term in visible for term in (*excluded, '栖禾', '内容运营', '隐藏设定'))
+
+
+@pytest.mark.parametrize(('retold', 'finding', 'supported', 'rejection'), [
+    (False, 'k04_interview_route', [1], None),
+    (False, 'none', [1], None),
+    (True, 'k04_interview_route', [], 'k04_unverified'),
+    (False, 'unsupported_claim', [1], 'k04_unsupported'),
+], ids=['own-question-and-route','own-question-without-route','retold-question','unsupported-endorsement'])
+def test_lin_audit_keeps_question_and_reply_independent(monkeypatch, retold, finding, supported, rejection):
+    from backend.diagnostics import RuleRejected
+    from backend.policy import Audit
+    question = '这个岗位的正式招聘流程在哪里可以核对？'
+    text = f'同学问过「{question}」，我只是转述。' if retold else question
+    reply = {'k04_interview_route':LIN_ROUTE, 'none':VAGUE_REPLY, 'unsupported_claim':'这条群转发已由公司证实。'}[finding]
+    actions = [Action(kind=kind, focus='K04', source='own', quote=question) for kind in ('identify_gap','verify_official')]
+    adapter = CompatibleModel()
+    async def reviewer(system, payload, schema, *, temperature):
+        assert system == LIN_AUDIT and schema is Audit and temperature == 0
+        assert payload['current_user'] == text and payload['reply'] == reply
+        assert payload['candidates'] == [dict(index=i, **a.model_dump(exclude_none=True)) for i,a in enumerate(actions)]
+        return Audit(safe=True, k04=finding, supported=supported, disclosures=[], registration_quote=None)
+    monkeypatch.setattr(adapter, '_json', reviewer)
+    audit = asyncio.run(adapter.audit('lin', [], text, FACTS['lin'], False, actions, reply))
+    def validate(): return validate_reply(Reply(body=reply), audit, actions, FACTS['lin'], set(), False, role='lin')
+    if rejection:
+        with pytest.raises(RuleRejected) as refused: validate()
+        assert refused.value.rule.name == rejection
+    else:
+        _, valid, disclosed, _ = validate()
+        assert valid == [actions[1]] and disclosed == ({'K04':reply} if finding == 'k04_interview_route' else {})
 
 
 @pytest.mark.parametrize('add_judgment', [False, True], ids=['questions-only', 'later-own-judgment'])
@@ -394,5 +424,5 @@ def test_employer_question_unlocks_only_the_consultants_authorization_clue(wired
     for prompt,payload in calls[3:]:
         assert payload['private_history'] == []
         assert AUTH_REPLY not in json.dumps(payload, ensure_ascii=False)
-        if prompt in (GENERATE, AUDIT, K05_AUDIT):
+        if prompt in (GENERATE, LIN_AUDIT, K05_AUDIT):
             assert payload['permitted_facts'] == {}

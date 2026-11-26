@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
+from .diagnostics import Rule, RuleRejected
 from .registration import Availability, CHAT_STATUSES, FieldKey, Status, availability
 
 Role = Literal['lin', 'chen', 'wang']
@@ -102,11 +103,11 @@ ASK_PRIVATE = re.compile(r'(?:提供|提交|发给我|填写|上传|发来|告�
 
 def check_generated(body):
     if not body.strip() or sensitive(body) or re.search(r'https?://|www\.', body, re.I):
-        raise ValueError('unapproved reply')
+        raise RuleRejected(Rule.generated_content)
     for sentence in re.split(r'[，。！？；\n]', body):
         match = ASK_PRIVATE.search(sentence)
         if match and not re.search(r'(?:不必|无需|不用|不会|不需要|不要|不应|不收集|不要求|不可|不能|禁止|请勿|切勿|不建议|避免|拒绝).{0,10}$', sentence[:match.start()]):
-            raise ValueError('sensitive solicitation')
+            raise RuleRejected(Rule.sensitive_solicitation)
 
 def validate_actions(analysis, body, role, registered):
     result, seen = [], {}
@@ -133,15 +134,15 @@ def validate_actions(analysis, body, role, registered):
             if a.position is not None:
                 pos = a.position
                 if not body.startswith(a.quote, pos):
-                    raise ValueError('registration quote position does not match the message')
+                    raise RuleRejected(Rule.registration_quote_position)
             elif body.find(a.quote, pos + 1) != -1:
-                raise ValueError('ambiguous registration quote position')
+                raise RuleRejected(Rule.registration_quote_ambiguous)
             a = a.model_copy(update={'position': pos})
         key = (a.kind, a.focus, a.field, a.position if a.kind in REGISTRATION_ACTIONS else None)
         evidence = a.status
         if key in seen:
             if seen[key] != evidence:
-                raise ValueError('conflicting registration choices at the same position')
+                raise RuleRejected(Rule.registration_choice_conflict)
             continue
         result.append((pos, a))
         seen[key] = evidence
@@ -152,7 +153,7 @@ def validate_actions(analysis, body, role, registered):
     for control in controls:
         for a in ordered:
             if a is not control and a.kind in REGISTRATION_ACTIONS and a.status != 'submitted' and max(a.position, control.position) < min(a.position + len(a.quote), control.position + len(control.quote)):
-                raise ValueError('overlapping registration control and response')
+                raise RuleRejected(Rule.registration_overlap)
     return ordered
 
 
@@ -183,15 +184,15 @@ def registration_turn(state, actions):
 
 def validate_registration_reply(audit, turn, invited_now, submitted):
     if audit.received_now:
-        raise ValueError('chat cannot acknowledge a new receipt')
+        raise RuleRejected(Rule.invented_new_receipt)
     possible_prior = set(submitted) | ({'unspecified'} if submitted else set())
     if set(audit.previously_received) - possible_prior:
-        raise ValueError('reply invents a previous receipt')
+        raise RuleRejected(Rule.invented_prior_receipt)
     actual = 'open' if invited_now else turn.availability
     if audit.reply_availability not in ('unstated', actual):
-        raise ValueError('reply contradicts registration availability')
+        raise RuleRejected(Rule.registration_availability)
     if any(a.kind == 'resume_registration' for a in turn.this_turn) and actual == 'open' and audit.reply_availability != 'open':
-        raise ValueError('reply did not confirm that registration is open again')
+        raise RuleRejected(Rule.registration_reopen)
 
 
 def permission(role, actions, previous, turn):
@@ -206,45 +207,53 @@ def k05_parts(body):
 def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
     body = reply.body.strip()
     if not audit.safe:
-        raise ValueError('unapproved reply')
+        raise RuleRejected(Rule.audit_unsafe)
     if any(i < 0 or i >= len(actions) for i in audit.supported):
-        raise ValueError('invalid evidence indexes')
+        raise RuleRejected(Rule.evidence_index)
     valid = [a for i,a in enumerate(actions) if i in audit.supported]
     allowed = {a.focus for a in valid if a.kind in ASKS}
     unverified = set(facts) - set(previous) - allowed
     # A rejected K04 question need not discard a harmless reply that didn't use its fact.
     if unverified - {'K04'}:
-        raise ValueError('unverified permission')
+        raise RuleRejected(Rule.unverified_permission)
     parts = k05_parts(body) if role == 'wang' else []
     disclosed = {}
     for d in audit.disclosures:
-        if d.focus not in facts or d.quote not in body:
-            raise ValueError('unattributed disclosure')
+        if d.focus not in facts:
+            raise RuleRejected(Rule.disclosure_not_permitted)
+        if d.quote not in body:
+            raise RuleRejected(Rule.disclosure_quote_mismatch)
         if d.focus == 'K04':
             continue  # A topic excerpt cannot establish what the complete reply meant.
         if d.focus != 'K05':
             disclosed.setdefault(d.focus, d.quote)
         elif role != 'wang' or (d.quote != body and d.quote not in parts):
-            raise ValueError('unexpected K05 excerpt')
+            raise RuleRejected(Rule.k05_excerpt)
     if 'K04' in facts and audit.k04 is None:
-        raise ValueError('missing K04 assessment')
+        raise RuleRejected(Rule.k04_missing)
     if audit.k04 not in (None, 'none'):
-        if audit.k04 != K04_BY_ROLE.get(role) or 'K04' not in facts or 'K04' in unverified:
-            raise ValueError('unsupported or unapproved K04 claim')
+        if audit.k04 == 'unsupported_claim':
+            raise RuleRejected(Rule.k04_unsupported)
+        if audit.k04 != K04_BY_ROLE.get(role):
+            raise RuleRejected(Rule.k04_wrong_role)
+        if 'K04' not in facts:
+            raise RuleRejected(Rule.k04_not_permitted)
+        if 'K04' in unverified:
+            raise RuleRejected(Rule.k04_unverified)
         disclosed['K04'] = body
     if (role == 'wang') != (audit.k05 is not None):
-        raise ValueError('missing or out-of-scope K05 assessment')
+        raise RuleRejected(Rule.k05_scope)
     if audit.k05 is not None:
         ids = sorted(claim.part_id for claim in audit.k05)
         if ids != list(range(len(parts))):
-            raise ValueError('invalid or incomplete K05 part IDs')
+            raise RuleRejected(Rule.k05_parts)
         kinds = {claim.kind for claim in audit.k05}
         if 'self_denies_job_check' in kinds:
             if 'K05' not in facts or 'uncertain' in kinds:
-                raise ValueError('unapproved or contradictory K05 disclosure')
+                raise RuleRejected(Rule.k05_disclosure)
             # A later clause can qualify an earlier one, so cite the intact Wang reply.
             disclosed['K05'] = body
     reg = audit.registration_quote
     if reg is not None and (not reg.strip() or reg not in body or not invite or not any(a.kind == 'interest' for a in valid)):
-        raise ValueError('unapproved registration')
+        raise RuleRejected(Rule.registration_invite)
     return body, valid, disclosed, reg

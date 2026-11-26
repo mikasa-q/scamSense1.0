@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker
 
@@ -251,7 +252,7 @@ def test_upgrade_from_main_preserves_sessions_messages_and_saved_review(tmp_path
     assert 'registration_entries' not in inspect(engine).get_table_names()
     command.upgrade(config, 'head')
     with engine.connect() as conn:
-        assert conn.scalar(text('SELECT version_num FROM alembic_version')) == '0004_explicit_confirmation'
+        assert conn.scalar(text('SELECT version_num FROM alembic_version')) == ScriptDirectory.from_config(config).get_current_head()
         assert conn.execute(text('PRAGMA foreign_key_check')).all() == []
     training.check_access(factory, sid, session['token'])
     snap = training.snapshot(factory, sid)

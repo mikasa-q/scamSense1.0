@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: scamsense-classroom
+    runtime: docker
+    region: singapore
+    plan: 0.5c-512mb
+    numInstances: 1
+    autoDeployTrigger: "off"
+    healthCheckPath: /api/health
+    disk:
+      name: training-records
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: "8765"
+      - key: SCAMSENSE_DATABASE_URL
+        value: sqlite:////app/data/scamsense.sqlite3
+      - key: SCAMSENSE_ACCESS_MODE
+        value: classroom
+      - key: SCAMSENSE_CLASS_INVITE
+        generateValue: true
+      - key: SCAMSENSE_MAX_SESSIONS
+        value: "40"
+      - key: SCAMSENSE_MAX_TURNS
+        value: "240"
+      - key: SCAMSENSE_TURNS_PER_SESSION
+        value: "20"
+      - key: OPENAI_BASE_URL
+        value: https://api.deepseek.com
+      - key: OPENAI_MODEL
+        value: deepseek-flash
+      - key: OPENAI_API_KEY
+        sync: false

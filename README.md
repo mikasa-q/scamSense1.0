@@ -16,7 +16,8 @@ py -3.13 run.py --setup
 数据库默认在 `data/scamsense.sqlite3`，不要随发布目录删除；已有库先备份再启动。重启后用**同一浏览器、同一来源（含端口）**打开「训练记录」。后端保留消息、登记和复盘，浏览器本地只保存训练索引及访问凭据；待确认的发言草稿与请求编号临时放在当前标签页，按场次和联系人隔离，确认完成后清除。不要分享浏览器存储。清掉凭据后，单靠训练链接不能恢复访问。
 
 - [3–5 分钟现场演示／可选真模型冒烟清单](docs/demo.md)
-- [CVM 生产配置、同源或独立前端、SQLite 备份与恢复](docs/deploy.md)
+- [让同学点邀请链接训练：沿用现有 Railway 服务、保护原库并验收](docs/deploy.md#现有-railway-服务从试用后端切换到班级训练)
+- [CVM 生产配置、同源或独立前端、SQLite 备份与恢复](docs/deploy.md#代码数据和进程)
 - [2026-11-23 本地 MVP 验收记录：测试替身与未验证项](docs/verification.md)
 
 ## 用 Docker 运行预览版
@@ -38,7 +39,8 @@ docker run -d --name scamsense -p 127.0.0.1:8765:8765 -v scamsense-data:/app/dat
 
 | 环境变量 | 含义 |
 | --- | --- |
-| `OPENAI_API_KEY` | 远程模型的服务端密钥。默认调用 OpenAI。如使用本机回环地址的兼容模型，可不设密钥。 |
+| `OPENAI_API_KEY` | 本地或 Render 的远程模型密钥。使用本机回环模型可不设。 |
+| `SCAMSENSE_DEEPSEEK_API_KEY` | Railway 班级版专用的服务端密钥，只连 DeepSeek 官方接口。不要把它填到给学生的邀请链接里。 |
 | `OPENAI_BASE_URL` | 供应商给出的 Chat Completions API 根地址，不含 `/chat/completions`；应用只拼接这个端点。根地址是否包含 `/v1` 取决于服务商，远程必须用 HTTPS。 |
 | `OPENAI_MODEL` | 服务实际支持的模型 ID，默认 `gpt-4o-mini`；需支持 Chat Completions 的 `json_object` 输出。 |
 | `SCAMSENSE_DATABASE_URL` | 可选，SQLite 连接串；默认持久化到 `data/scamsense.sqlite3`，自定义路径须先创建父目录。 |
@@ -57,7 +59,7 @@ docker run -d --name scamsense -p 127.0.0.1:8765:8765 -v scamsense-data:/app/dat
 - `backend/`：请求回执、私聊编排、事实权限、模型适配与复盘。会话凭据只存摘要；同场限一个在途请求；通过校验后事务性提交正文、事件与证据。相同标识和内容重发不重复生成。
 - `migrations/`：数据库迁移。`frontend/`：工作台、训练记录、三个私聊、终局与复盘。
 - `tests/`：临时 SQLite 与仅测试使用的模型替身。已安装依赖后运行 `.\.venv\Scripts\python.exe -m pytest -q`。前端类型检查及构建：`npm --prefix frontend run build`。
-- 前端热更新：先运行后端，再执行 `npm --prefix frontend run dev`；开发代理指向 8765。独立部署前端时可在**构建前**配置公开地址 `VITE_API_BASE_URL`（不含 `/api`），后端 `SCAMSENSE_WEB_ORIGIN` 配置允许的单一前端来源。当前交付仅为本地原型，未部署云资源。
+- 前端热更新：先运行后端，再执行 `npm --prefix frontend run dev`；开发代理指向 8765。独立部署前端时可在**构建前**配置公开地址 `VITE_API_BASE_URL`（不含 `/api`），后端 `SCAMSENSE_WEB_ORIGIN` 配置允许的单一前端来源。Railway 班级入口使用现有持久卷和服务端 DeepSeek 配置；请分别验证页面可打开、受邀开场和真实模型回复，健康检查不能替代对话验收。
 
 ### 可复跑的浏览器验收（可选、只用测试替身）
 

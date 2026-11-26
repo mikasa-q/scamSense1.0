@@ -1,6 +1,46 @@
-# 部署准备：单台 CVM，SQLite 持久化
+# 部署准备：单实例，SQLite 持久化
 
-以下是供获授权运维者采用的最小配置，**不是上线记录**。本次交付不创建云资源、不配置 DNS、不申领证书。示例域名为占位符。Windows 本地生产构建与运行见 README；腾讯云、systemd、Nginx 和 HTTPS 未在目标环境实测。
+给同学发完整的班级邀请，不要发本机地址、GitHub 仓库、站点管理台或自己的聊天页。
+
+## 班级入口与验收（2026-11-26，北京时间）
+
+- **现在发给同学：** 使用组织者本机 `data/classroom-invitation.txt` 中的 Railway 完整邀请。网页和 API 都在 Railway，已通过真实 DeepSeek 对话、刷新和复盘验收；学生不需要模型密钥。
+- **原 Qoder Sites 入口：** [ScamSense 求职判断力训练室](https://scamsense-lab-cnexhxc1kvo.qoder.zone) 已发布同一班级前端。发布时为私有，随后核对时已允许匿名打开网页；这不代表可以无邀请开场或读取别人的记录。`data/classroom-invitation-qoder.txt` 是同一邀请码对应的 Sites 链接。站点访问权限和新建训练的邀请不是一回事；邀请文件均不进 Git 或发布包。浏览器的训练凭据按域名保存，从哪里开的训练就从哪里回看。
+
+| 本次 Sites 同步 | 实测结果 |
+| --- | --- |
+| 发布版本 | 原项目、原域名，平台确认已发布；发布首页与本地构建指纹一致。只上传首页、教学示例、JS、CSS 四个文件。 |
+| Railway 连接 | 健康请求及带 `Authorization`、`Content-Type` 的建场预检均为 200，允许来源精确匹配 Sites 域名；未获准的来源预检为 400，没有允许来源头。没有改动后端、数据库或密钥。 |
+| 浏览器训练流程 | 本地测试验证无邀请拒绝、受邀建场、刷新和跨浏览器隔离。Sites 发布时的登录限制与后来的公开网页分别核对过：公开后可匿名读取邀请、连接 Railway 健康接口。没有在 Sites 入口重新验收收费对话。 |
+
+再次同步时，构建单独的 Sites 输出，保留 Railway 的同源构建：`VITE_API_BASE_URL=https://api-production-1b849a94.up.railway.app npm --prefix frontend run build -- --outDir dist-sites`。只将 `frontend/dist-sites` 发布到**同一项目**，不要为同步代码更改站点访问权限。给同学发组织者保留的完整邀请，不要复制打开后已移除邀请片段的聊天页地址。
+
+## 现有 Railway 服务：从试用后端切换到班级训练
+
+沿用 `production` 的 `api` 服务、原公网域名和挂在 `/data` 的 `api-volume`。这个项目不需要新建服务、域名或磁盘；Railway 管理页不是发给同学的邀请。
+
+1. 现有试用版配置了 IP 白名单（`SCAMSENSE_TRIAL_IPS`）。保留该变量，旧镜像回退时仍使用原规则。新镜像看到旧变量时，除非站主显式选择 `SCAMSENSE_ACCESS_MODE=classroom`，否则在迁移前就停止；显式切换后仍须同时满足随机邀请、原库和 DeepSeek 配置检查。新入口用班级邀请而非来源 IP 决定能否开场。若还需要限制来源 IP，不要切到此入口。不要应用或丢弃控制台上其他服务的待发布改动。
+2. 先核实原库的准确文件名和挂载、应用用户的读写权限，按站主的既有备份流程留可恢复的副本；若备份需要另付费先确认。`SCAMSENSE_DATABASE_URL` 必须指向 `RAILWAY_VOLUME_MOUNT_PATH` 内**原来已迁移的库**，不要照搬 Render 的 `/app/data`。没有找到原库时不会另建空库。容器使用平台的 `PORT` 和单工作进程。
+3. 将 `SCAMSENSE_ACCESS_MODE` 设为 `classroom`。班级邀请 `SCAMSENSE_CLASS_INVITE` 独立随机生成；DeepSeek 密钥由站主在 `api → Variables` 单独录入为 **`SCAMSENSE_DEEPSEEK_API_KEY`**，建议设为 Sealed。这个名字不会启用现有试用版的模型，Railway 班级版只把它发送到 `https://api.deepseek.com`。不要公开邀请、不要把模型密钥发到聊天或放入前端，不要点击混有其他服务变更的全局 Deploy。班级默认限额见下文。每次真实训练可能有模型费用，试用计划也不保证永久在线。
+4. 仅定向发布到既有 `api` 服务，确认原盘仍在。用未登录管理台的浏览器验证首页、静态资源和 `/api/health` 的 `invite_required=true`；确认没邀请就不能开场。用于班内私发的格式是服务的 HTTPS 地址加 `/#invite=` 和班级邀请值。`model_configured=true` 不证明真实回复；在授权 DeepSeek 用量后才做真实对话和复盘验收。
+
+## Render 班级邀请链接
+
+以下是**另选 Render 时**的方案，不是现有 Railway 服务的发布步骤。
+
+选这条路径后，网页、API 和数据库都在云端；同学不用安装软件、登录 Render 或填写 DeepSeek 密钥。
+
+1. **先确认预算和代码版本。** 按 2026-11-25 的 [Render 定价](https://render.com/pricing)，Hobby 工作区无月费；0.5 CPU / 512 MB 单实例约 7 美元/月，1 GB 持久盘 0.25 美元/月，连续运行的基础费用约 **7.25 美元/月**，不含税、超额流量和 [DeepSeek 用量](https://api-docs.deepseek.com/quick_start/pricing)。免费实例不能挂这块盘。只有得到授权才提交、推送包含 `render.yaml` **及班级准入代码**的版本；不需要合进主版本、发布镜像或上传本机数据库。
+2. **由站主授权。** 在自己的 [Render 控制台](https://dashboard.render.com/) 选择 Hobby 工作区，GitHub 应用仅授权这个仓库。选择 **New → Blueprint**，选含本次改动的分支和根目录 `render.yaml`。确认将创建**新的** Web Service 而非更改同名旧服务，只有一个新加坡实例、一个挂在 `/app/data` 的 1 GB 盘，没有其他资源；核对平台显示的金额后再点击创建。不要部署只有打包检查、尚无班级保护的版本。
+3. **分开两种密钥。** 只在 Render 的受保护设置中填 `OPENAI_API_KEY`（建议用专用、未公开的 DeepSeek 密钥），API 根地址和模型已在模板中设为 `https://api.deepseek.com` / `deepseek-flash`。`SCAMSENSE_CLASS_INVITE` 则由 Render 随机生成，**不是模型密钥**；两者都不进 Git、构建参数引用、`VITE_*` 或日志。Docker 在挂盘后的启动阶段迁移 SQLite，再启动单个非 root 进程。若迁移报不可写，先核实挂载与运行用户权限，不要改用临时盘或开放所有权限。
+4. **拿到班级链接。** 服务显示 Live 后，从控制台复制实际的 HTTPS 服务地址，在末尾加上 `/#invite=` 和 **`SCAMSENSE_CLASS_INVITE` 的值**（保留 `+`、`/`、`=` 字符）；只在班内私发完整链接，不要把它或密钥发到问题区。打开后点「进入训练」。邀请放在 `#` 后，不随页面 GET 发送；网页读取后移除地址片段，只在建场时用请求头出示。请发原邀请链接，而不是复制去掉邀请的地址或你自己的聊天页面。只打开链接不会占用训练名额。
+5. **外网验收后再分发。** 用新的浏览器配置文件或手机移动网络打开裸地址，确认不能新建；再用实际邀请链接建场，向王宇问「这条转发你亲自向招聘方核实过吗？」，等进度和一条通过审核的角色回复。结束、刷新并回看；另一个浏览器不能通过聊天地址读到该记录。一次真实回合最多 3 次收费调用。仅显示网页、`/api/health` 成功或 `model_configured=true` **都不算**。上线验收还应在维护窗口保留原磁盘、重启服务，用原浏览器确认回复与复盘仍在。
+
+默认**整班累计** 40 场（`SCAMSENSE_MAX_SESSIONS`）、240 次对话尝试（`SCAMSENSE_MAX_TURNS`），每场最多 20 次（`SCAMSENSE_TURNS_PER_SESSION`），同时最多 3 场在生成。模型/校验失败后重新生成也计数；取回已完成的同一请求不重复扣，浏览、结束和复盘不扣。班级模式每次模型调用最多输出 2048 tokens。这是本站的次数和输出长度上限，不是美元账单上限；泄露的模型密钥被直接用于供应商 API 不受本站限制。名额按场而非按人，关掉浏览器不释放；重启、重新部署到同一块盘、轮换邀请都不清零。需要继续办班时显式调高累计上限并重启，不要删库。若链接外泄，轮换班级邀请以阻止旧链接再开场；已开场仍可用自己的凭据，要紧急停用**新的模型调用**则把 `SCAMSENSE_MAX_TURNS` 设为 `0` 并应用，不影响回看。恢复旧备份也会恢复旧计数，重新开放前须核对预算。
+
+## 单台 CVM
+
+以下供已有 CVM 的运维者参考。示例域名为占位符；腾讯云、systemd、Nginx 和 HTTPS 未在目标环境实测。公开招生前也须按上文设置 `SCAMSENSE_ACCESS_MODE=classroom` 和独立随机邀请，不要把无准入的本地服务直接开放到公网。
 
 ## 代码、数据和进程
 
