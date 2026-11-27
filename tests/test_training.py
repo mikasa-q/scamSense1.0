@@ -119,42 +119,46 @@ def test_source_only_is_not_k05(lab, question, reply, kinds, overclaims):
     assert report_dims(r)['verify']['evidence'][-1]['message_id'] == user['id']
 
 @pytest.mark.parametrize('supported', [[], [0]], ids=['not-confirmed', 'confirmed'])
-def test_forward_channel_question_can_get_public_answer_without_unlocking_k05(lab, supported):
+def test_forward_channel_reply_can_stay_public_even_with_k05_available(lab, supported):
     question = '你是从哪里看到这条招聘消息的？'
     body = '我在校园求职群里看到的。'
     lab.model.actions = [action('verify_friend', 'K05', question, inquiry='forward_source')]
     lab.model.supported, lab.model.body, lab.model.k05 = supported, body, labels('origin')
     assert 'event: done' in lab.post(question).text
-    assert all(call[3] == {} for call in lab.model.calls if call[0] in ('reply', 'audit'))
+    assert all(set(call[3]) == {'K05'} for call in lab.model.calls if call[0] in ('reply', 'audit'))
     assert [m['body'] for m in lab.snap()['messages']] == [question, body]
+    assert not training.private_context(lab.app.state.factory, lab.sid, 'wang')[1]
     report = lab.end(kind='early').json()
     assert not report['disclosures'] and not report_dims(report)['risk']['evidence']
     assert [e['quote'] for e in report_dims(report)['verify']['evidence']] == ([question] if supported else [])
 
 
 @pytest.mark.parametrize('inquiry', ['forward_source', None], ids=['channel-only', 'unspecified'])
-def test_channel_or_unspecified_inquiry_cannot_release_unseen_personal_check(lab, inquiry):
+def test_source_question_can_receive_wangs_volunteered_experience(lab, inquiry):
     question = '这个消息你是在哪儿看到的呀？'
     lab.model.actions = [action('verify_friend', 'K05', question, inquiry=inquiry)]
-    assert_k05_turn_rejected(lab, lab.post(question))
+    assert 'event: done' in lab.post(question).text
+    user, wang = lab.snap()['messages']
+    report = lab.end(kind='early').json()
+    ref, = report['disclosures']
+    assert (ref['speaker'], ref['message_id'], ref['quote']) == ('assistant', wang['id'], ANSWER)
+    dims = report_dims(report)
+    assert [(e['message_id'], e['quote']) for e in dims['verify']['evidence']] == [(user['id'], question)]
+    assert not dims['risk']['evidence'] and not dims['sources']['evidence']
 
 
 @pytest.mark.parametrize('reverse', [False, True])
 @pytest.mark.parametrize('supports_check', [False, True])
-def test_two_distinct_questions_only_unlock_the_confirmed_subject(lab, reverse, supports_check):
+def test_two_distinct_questions_only_credit_the_supported_question(lab, reverse, supports_check):
     origin, check = '这个消息在哪看的？', '你自己向招聘方查过吗？'
     candidates = [action('verify_friend', 'K05', origin, inquiry='forward_source'),
                   action('verify_friend', 'K05', check, inquiry='personal_check')]
     lab.model.actions = candidates[::-1] if reverse else candidates
     lab.model.supported = [lab.model.actions.index(candidates[1 if supports_check else 0])]
-    response = lab.post(origin + check)
-    if not supports_check:
-        assert_k05_turn_rejected(lab, response)
-    else:
-        assert 'event: done' in response.text
-        report = lab.end(kind='early').json()
-        assert [ref['quote'] for ref in report['disclosures']] == [ANSWER]
-        assert [ref['quote'] for ref in report_dims(report)['verify']['evidence']] == [check]
+    assert 'event: done' in lab.post(origin + check).text
+    report = lab.end(kind='early').json()
+    assert [ref['quote'] for ref in report['disclosures']] == [ANSWER]
+    assert [ref['quote'] for ref in report_dims(report)['verify']['evidence']] == [check if supports_check else origin]
 
 
 @pytest.mark.parametrize(('reply','kinds'), [
@@ -219,11 +223,15 @@ def assert_k05_turn_rejected(lab, result):
 
 @pytest.mark.parametrize(('body', 'kinds', 'reported', 'reason'), [
     ('同学转给我的，我在校园群看到的。', ('origin', 'origin'), False, None),
+    ('群里看到的，你也可以自己看看。', ('origin', 'other'), False, None),
+    ('我也有点拿不准。你怎么看？', ('other', 'other'), False, None),
+    ('我不知道发消息的人有没有问过。', ('other_person',), False, None),
     ('同学转给我的，我在校园群看到的。', ('origin',), False, 'k05_parts'),
-    ('我在校园群看到的。', ('origin',), True, 'unverified_permission'),
-    ('我记不清有没有去问过。', ('uncertain',), False, 'unverified_permission'),
-    ('我没有亲自问过招聘方。', (DENIAL,), False, 'k05_not_permitted'),
-], ids=['public-source', 'incomplete-audit', 'conflicting-audit', 'uncertain', 'private-fact'])
+    ('我在校园群看到的。', ('origin',), True, None),
+    ('我记不清有没有去问过。', ('uncertain',), False, None),
+    ('我没有亲自问过招聘方。', (DENIAL,), False, None),
+], ids=['public-source', 'source-and-advice', 'small-talk', 'other-person', 'incomplete-audit',
+        'overclaimed-source', 'uncertain', 'volunteered-fact'])
 def test_disputed_personal_check_with_a_source_question(lab, caplog, body, kinds, reported, reason):
     question = '你是从哪儿看到这条招聘消息的？'
     lab.model.actions = [action('verify_friend', 'K05', question, inquiry='personal_check')]
@@ -240,7 +248,7 @@ def test_disputed_personal_check_with_a_source_question(lab, caplog, body, kinds
     assert 'event: done' in result.text
     assert [m['body'] for m in lab.snap()['messages']] == [question, body]
     report = lab.end(kind='early').json()
-    assert report['disclosures'] == []
+    assert [(e['speaker'], e['quote']) for e in report['disclosures']] == ([('assistant', body)] if DENIAL in kinds else [])
     assert all(not dimension['evidence'] for dimension in report['dimensions'])
 
 
@@ -281,11 +289,14 @@ def test_k05_generic_disclosure_cannot_supply_a_clipped_quote(lab, kind):
     ('我也不确定，可能没有核实过。', ('uncertain',DENIAL)),
     ('没有。\n其实我记不清自己问过没有了。', (DENIAL,'uncertain')),
 ], ids=['qualification-before','qualification-after'])
-def test_k05_conflicting_labels_cannot_drop_a_qualification(lab, caplog, reply, kinds):
+def test_qualified_permitted_reply_is_saved_without_a_disclosure(lab, reply, kinds):
     lab.model.body, lab.model.k05 = reply, labels(*kinds)
-    assert_k05_turn_rejected(lab, lab.post())
-    records = [r for r in caplog.records if r.name == 'backend.diagnostics']
-    assert [json.loads(r.getMessage())['reason_code'] for r in records] == ['k05_conflicting_evidence']
+    assert 'event: done' in lab.post().text
+    assert [m['body'] for m in lab.snap()['messages']] == [ASK, reply]
+    assert not training.private_context(lab.app.state.factory, lab.sid, 'wang')[1]
+    report = lab.end(kind='early').json()
+    assert not report['disclosures'] and not report_dims(report)['risk']['evidence']
+    assert [e['quote'] for e in report_dims(report)['verify']['evidence']] == [ASK]
 
 @pytest.mark.parametrize(('role', 'body', 'generic_quote'), [
     ('lin', '我们一般用官方邮箱发通知。', '官方邮箱'),
@@ -436,12 +447,11 @@ def test_role_and_session_isolation(lab):
     assert not lab.client.get('/api/sessions/'+second['id'],headers=hdr).json()['messages']
     assert lab.client.post('/api/sessions/'+second['id']+'/finish',headers=hdr,json={'kind':'decision','choice':'leave','cited':[lab.snap()['messages'][0]['id']]}).status_code == 422
 
-@pytest.mark.parametrize('failure',['analysis','reply','audit','unsafe','badquote','unapproved','sensitive','solicitation','unsupported'])
+@pytest.mark.parametrize('failure',['analysis','reply','audit','unsafe','badquote','unapproved','sensitive','solicitation'])
 def test_model_failure_rolls_back_and_original_id_retries(lab, failure):
     rid = str(uuid4())
     lab.model.break_at = failure
     if failure == 'unsafe': lab.model.safe = False
-    if failure == 'unsupported': lab.model.supported = []
     if failure == 'badquote': lab.model.disclosures = [Disclosure(focus='K05',quote='并未说过这句话')]
     if failure == 'unapproved': lab.model.disclosures = [Disclosure(focus='K04',quote=ANSWER)]
     if failure == 'sensitive': lab.model.body = '请写邮件至 demo@example.org'

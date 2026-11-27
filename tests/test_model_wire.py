@@ -19,6 +19,8 @@ JUDGMENT = '群里转发不能证明招聘方获得了授权。'
 REPLY = '没有，群里看到的。'
 MEMORY_QUESTION = '你还记得当时有没有问过招聘方吗？'
 SOURCE_QUESTION = '你从哪看到的？'
+SOURCE_REMARK = '原来是群里传的呀。'
+VOLUNTEERED_REPLY = '嗯，同学转的，我也没问过招聘方。'
 WANG_STARTER = '你是从哪里看到这条招聘消息的？'
 CHEN_STARTER = '你和招聘企业是什么关系？'
 LIN_STARTER = '这个岗位的正式招聘流程在哪里可以核对？'
@@ -70,6 +72,7 @@ TURNS = {
     QUESTION: ([friend_inquiry(QUESTION, 'personal_check')], REPLY, [], ('self_denies_job_check','origin')),
     MEMORY_QUESTION: ([friend_inquiry(MEMORY_QUESTION, 'personal_check')], '我记不清当时问过没有。', [], ('uncertain',)),
     SOURCE_QUESTION: ([friend_inquiry(SOURCE_QUESTION, 'forward_source')], SOURCE_REPLY, [], ('origin',)),
+    SOURCE_REMARK: ([], VOLUNTEERED_REPLY, [], ('other', 'origin', 'self_denies_job_check')),
     JUDGMENT: ([('identify_gap','K01'),('weigh_sources','K01')], '明白，你想先找依据。', [], ('other','other')),
     AUTH_QUESTION: ([('ask_employer','K01')], AUTH_REPLY, [{'focus':'K01','quote':AUTH_REPLY}], ()),
 }
@@ -90,6 +93,8 @@ def wire_fixture(api_root='/v1'):
             pairs, reply, disclosures, kinds = TURNS[msg]
             if system in (INTERPRET, K05_INTERPRET, CHEN_INTERPRET):
                 result = {'actions':[p if isinstance(p, dict) else {'kind':p[0],'focus':p[1],'quote':msg,'source':'own'} for p in pairs]}
+                if system == K05_INTERPRET and msg in (SOURCE_REMARK, SOURCE_QUESTION, HELLO):
+                    result['discussing_source'] = msg == SOURCE_REMARK
             elif system in (GENERATE, WANG_GENERATE, CHEN_GENERATE):
                 result = {'body':reply}
             elif system in (LIN_AUDIT, K05_AUDIT, CHEN_AUDIT):
@@ -129,11 +134,12 @@ def wired_session(tmp_path, monkeypatch):
     ('我在整理校园招聘的信息渠道，你是在校园群、公众号还是学校网站看到这条消息的？', 'forward_source', True,
      '我在校园群看到的，当时觉得挺有意思的，但没去查真伪。', ('没去查真伪',)),
     ('这条消息是你从学校官网看到的吗？', 'forward_source', False, '没有，群里看到的。', ()),
+    (SOURCE_QUESTION, 'forward_source', False, '是校园群里转的，我没亲自找招聘方确认。', ('没亲自找招聘方确认',)),
     (SOURCE_QUESTION, 'forward_source', False, '校园群里有人转发过。', ()),
     (SOURCE_QUESTION, 'forward_source', False, '我是在群里看到的，没问清楚源头。', ()),
     (QUESTION, 'personal_check', False, '发给我的同学没亲自核实。', ()),
     (QUESTION, 'personal_check', False, '我记不清当时问过没有。', ()),
-], ids=['elliptical', 'natural', 'mixed', 'elliptical-origin', 'source', 'forward-origin', 'other-person', 'uncertain'])
+], ids=['elliptical', 'natural', 'mixed', 'elliptical-origin', 'volunteered', 'source', 'forward-origin', 'other-person', 'uncertain'])
 def test_live_k05_judgment(question, inquiry, previously_disclosed, reply, evidence):
     action = Action(**friend_inquiry(question, inquiry))
     previous = {'K05'} if previously_disclosed else set()
@@ -162,7 +168,7 @@ def test_two_turns_through_compatible_http_contract(wired_session, question, exp
     assert [prompt for prompt,_ in calls] == [K05_INTERPRET,WANG_GENERATE,K05_AUDIT]*2
     reply = ''.join(expected_parts)
     audit = calls[2][1]
-    expected_facts = {} if question == SOURCE_QUESTION else {'K05':FACTS['wang']['K05']}
+    expected_facts = {'K05':FACTS['wang']['K05']}
     assert calls[1][1]['permitted_facts'] == audit['permitted_facts'] == expected_facts
     assert audit['current_user'] == question and audit['reply'] == reply
     assert audit['reply_parts'] == [{'part_id':i, 'text':part} for i, part in enumerate(expected_parts)]
@@ -175,6 +181,22 @@ def test_two_turns_through_compatible_http_contract(wired_session, question, exp
         assert report['disclosures'] == []
     risk, = report['dimensions'][0]['evidence']
     assert (risk['speaker'],risk['message_id'],risk['quote']) == ('user',3,JUDGMENT)
+
+
+def test_wang_can_volunteer_a_fact_without_a_student_action(wired_session):
+    client, path, headers, calls = wired_session
+    for text in (HELLO, SOURCE_REMARK):
+        response = client.post(path+'/turns', headers=headers, json={'role':'wang', 'text':text, 'request_id':str(uuid4())})
+        assert 'event: done' in response.text
+    assert calls[1][1]['permitted_facts'] == {}
+    assert calls[4][1]['permitted_facts'] == {'K05':FACTS['wang']['K05']}
+    assert calls[5][1]['candidates'] == []
+    messages = client.get(path, headers=headers).json()['messages']
+    assert [m['body'] for m in messages[-2:]] == [SOURCE_REMARK, VOLUNTEERED_REPLY]
+    report = client.post(path+'/finish', headers=headers, json={'kind':'early'}).json()
+    ref, = report['disclosures']
+    assert (ref['role'], ref['speaker'], ref['message_id'], ref['quote']) == ('wang', 'assistant', messages[-1]['id'], VOLUNTEERED_REPLY)
+    assert all(not dimension['evidence'] for dimension in report['dimensions'])
 
 
 def test_stopped_registration_blocks_a_supported_submission_and_keeps_k05_private(wired_session):

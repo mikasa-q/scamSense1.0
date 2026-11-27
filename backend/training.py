@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from .db import Ending, Message, Receipt, RegistrationConfirmation, RegistrationEntry, Review, StoryEvent, Trace, Training, evidence_rows, uid, writer
 from .diagnostics import Rule, RuleRejected, log_turn_failure
-from .policy import ASKS, DISCLOSURE_KINDS, K04_BY_ROLE, REGISTRATION_ACTIONS, WHY, check_generated, permission, registration_turn, validate_actions, validate_registration_reply, validate_reply
+from .policy import ASKS, DISCLOSURE_KINDS, K04_BY_ROLE, REGISTRATION_ACTIONS, WHY, WangAnalysis, check_generated, permission, registration_turn, validate_actions, validate_registration_reply, validate_reply
 from .registration import CHAT_STATUSES, FIELDS, LEGACY_TRACE_KIND, OPTIONS, apply_legacy_refusal, availability, registration_controls, registration_log, registration_snapshot, registration_state, was_invited
 from .review import RUBRIC, make_review, message_dict, saved_review
 
@@ -184,7 +184,8 @@ async def run_turn(factory, model, sid, reservation, role, text, progress):
                 apply_legacy_refusal(registration['items'], LEGACY_TRACE_KIND.get(legacy_scopes[row['id']]),
                                      row['quote'], row['message_id'])
         plan = registration_turn(registration, actions)
-        facts, invite = permission(role, actions, previous, plan)
+        discussing_source = isinstance(analysis, WangAnalysis) and analysis.discussing_source
+        facts, invite = permission(role, actions, previous, plan, discussing_source=discussing_source)
         context = None
         if plan:
             items = {i['key']: dict(i) for i in registration['items']}

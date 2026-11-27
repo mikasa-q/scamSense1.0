@@ -30,7 +30,6 @@ class Rule(Enum):
     k05_scope = 'missing or out-of-scope K05 assessment'
     k05_parts = 'invalid or incomplete K05 part IDs'
     k05_not_permitted = 'K05 disclosure was not permitted'
-    k05_conflicting_evidence = 'K05 denial and uncertainty about the same verification'
     registration_invite = 'unapproved registration'
     stale_attempt = 'stale attempt'
     chat_willingness_only = 'chat can only record willingness'

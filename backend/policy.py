@@ -3,7 +3,7 @@ import re
 import unicodedata
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .diagnostics import Rule, RuleRejected
 from .registration import Availability, CHAT_STATUSES, FieldKey, Status, availability
@@ -26,6 +26,14 @@ class Action(BaseModel):
 
 class Analysis(BaseModel):
     actions: list[Action] = Field(max_length=10)
+
+class WangAnalysis(Analysis):
+    discussing_source: bool = False
+
+    @field_validator('discussing_source', mode='before')
+    @classmethod
+    def optional_topic_hint(cls, value):
+        return value is True
 
 LegacyScope = Literal['city_only', 'project_only', 'city_later', 'project_later', 'items_only', 'whole', 'uncertain']
 
@@ -84,7 +92,7 @@ WHY = {
     'decline': '你明确停止了整个登记，不再主动邀请。',
     'resume_registration': '你主动提出恢复登记，不代表已经提交资料。',
     'ask_employer': '你主动询问了招聘主体或招聘授权。', 'ask_data': '你主动追问了资料的处理或必要性。',
-    'verify_official': '你主动寻找了可以独立核对的依据；提问不等于已核实。', 'verify_friend': '你向同学本人核对消息来源，而非把转发当作确认。',
+    'verify_official': '你主动寻找了可以独立核对的依据；提问不等于已核实。', 'verify_friend': '你向同学询问了这条消息的来源或核实经过。',
     'identify_gap': '你用自己的话指出了这条信息仍缺少什么依据。', 'weigh_sources': '你区分了信息来源，说明了现有材料不能证明什么。',
     'disclosure': '这段角色原话实际披露了该事实；不计作你的识别证据。',
     'k04_interview_route': '林悦给出了核对自己面试流程的办法。这不能证实群转发的岗位或顾问关系。',
@@ -197,12 +205,14 @@ def validate_registration_reply(audit, turn, invited_now, submitted):
 
 
 def requested_facts(actions):
-    # The public forwarding channel needs no access to Wang's firsthand verification history.
-    return {a.focus for a in actions if a.kind in ASKS and (a.kind != 'verify_friend' or a.inquiry == 'personal_check')}
+    return {a.focus for a in actions if a.kind in ASKS}
 
 
-def permission(role, actions, previous, turn):
+def permission(role, actions, previous, turn, *, discussing_source=False):
     wanted = set(previous) | requested_facts(actions)
+    if role == 'wang' and (discussing_source or any(a.focus == 'K05' for a in actions)):
+        # Wang can talk about his own experience even when the student has only made a remark.
+        wanted.add('K05')
     facts = {k:v for k,v in FACTS[role].items() if k in wanted}
     return facts, bool(role == 'chen' and turn and turn.allow_invitation)
 
@@ -219,7 +229,7 @@ def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
     valid = [a for i,a in enumerate(actions) if i in audit.supported]
     allowed = requested_facts(valid)
     unverified = set(facts) - set(previous) - allowed
-    # For this fact the audit covers the whole reply, so check what it actually revealed below.
+    # Wang's firsthand experience follows the topic. K04 has a separate whole-reply check below.
     assessed_fact = 'K05' if role == 'wang' else 'K04'
     if unverified - {assessed_fact}:
         raise RuleRejected(Rule.unverified_permission)
@@ -256,16 +266,11 @@ def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
             raise RuleRejected(Rule.k05_parts)
         kinds = {claim.kind for claim in audit.k05}
         if 'self_denies_job_check' in kinds:
-            if 'K05' not in facts or 'K05' in unverified:
+            if 'K05' not in facts:
                 raise RuleRejected(Rule.k05_not_permitted)
-            if 'uncertain' in kinds:
-                raise RuleRejected(Rule.k05_conflicting_evidence)
-            # A later clause can qualify an earlier one, so cite the intact Wang reply.
-            disclosed['K05'] = body
-        elif 'K05' in unverified:
-            reported_k05 = any(d.focus == 'K05' for d in audit.disclosures)
-            if kinds != {'origin'} or reported_k05:
-                raise RuleRejected(Rule.unverified_permission)
+            # A qualification is valid dialogue. Only an unqualified statement establishes the clue.
+            if 'uncertain' not in kinds:
+                disclosed['K05'] = body
     reg = audit.registration_quote
     if reg is not None and (not reg.strip() or reg not in body or not invite or not any(a.kind == 'interest' for a in valid)):
         raise RuleRejected(Rule.registration_invite)
