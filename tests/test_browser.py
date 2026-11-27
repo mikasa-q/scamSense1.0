@@ -15,9 +15,10 @@ from sqlalchemy import func, select
 
 from backend.db import ROOT, Message, Receipt, StoryEvent, Trace
 from backend.main import create_app
-from backend.model import GENERATE, K05_AUDIT, K05_INTERPRET, CompatibleModel
-from test_model_wire import (CHEN_ASK, CHEN_GAP, INTEREST, LIN_ASK, LIN_ROUTE, MIXED,
-                             QUESTION, REPLY, RESUME, STOP, wire_fixture)
+from backend.model import WANG_GENERATE, K05_AUDIT, K05_INTERPRET, CompatibleModel
+from test_model_wire import (AUTH_REPLY, CHEN_ASK, CHEN_GAP, CHEN_STARTER, INTEREST, LIN_ASK,
+                             LIN_ROUTE, LIN_STARTER, MIXED, QUESTION, REPLY, RESUME, SOURCE_REPLY,
+                             STOP, WANG_STARTER, wire_fixture)
 
 pytestmark = pytest.mark.skipif(os.getenv('SCAMSENSE_TEST_BROWSER') != '1', reason='enable built-page browser tests explicitly')
 
@@ -130,6 +131,39 @@ def test_shared_invite_creates_private_training_and_removes_fragment(ui):
     p.get_by_role('button', name='提前结束训练').click()
     p.get_by_role('button', name='结束并查看复盘').click()
     expect(p.get_by_text('你结束了模拟，没有作正式招聘决定。')).to_be_visible()
+
+
+def test_prompt_chips_and_identical_typed_questions_use_the_same_turn(ui):
+    from playwright.sync_api import expect
+    p = ui.page
+    contacts = [('wang', '王宇 大学同学', WANG_STARTER, SOURCE_REPLY),
+                ('chen', '陈浩 招聘顾问', CHEN_STARTER, AUTH_REPLY),
+                ('lin', '林悦 企业 HR', LIN_STARTER, LIN_ROUTE)]
+    clicked = {}
+    for use_chip in (True, False):
+        if not use_chip:
+            archive_new(p)
+        for role, name, text, reply in contacts:
+            p.get_by_role('link', name=name).click()
+            before = len(ui.calls)
+            if use_chip:
+                p.get_by_role('button', name='试着问：' + text).click()
+            else:
+                p.locator('#message').fill(text)
+            expect(p.locator('#message')).to_have_value(text)
+            with p.expect_request('**/turns') as req:
+                p.get_by_role('button', name='发送', exact=True).click()
+            wire = req.value.post_data_json
+            assert set(wire) == {'role', 'text', 'request_id'} and (wire['role'], wire['text']) == (role, text)
+            expect(p.locator('.message.user:not(.draft-bubble) p')).to_have_text([text])
+            expect(p.locator('.message.assistant p')).to_have_text([reply])
+            expect(p.get_by_role('alert')).to_have_count(0)
+            calls = ui.calls[before:]
+            assert len(calls) == 3 and all(data['private_history'] == [] for _, data in calls)
+            if use_chip:
+                clicked[role] = calls
+            else:
+                assert clicked[role] == calls
 
 
 def test_three_contacts_confirmation_decision_and_early_end(ui):
@@ -268,7 +302,7 @@ def test_refresh_during_sse_recovers_over_slow_session_reads(ui, monkeypatch):
         assert db.execute(select(Receipt.request_id, Receipt.status).where(Receipt.sid == sid)).one() == (turn_ids[0], 'done')
         assert db.scalars(select(Message.speaker).where(Message.sid == sid).order_by(Message.id)).all() == ['user', 'assistant']
     assert counts(ui, sid) == (1, 2, 2)
-    assert [prompt for prompt, _ in ui.calls] == [K05_INTERPRET, GENERATE, K05_AUDIT]
+    assert [prompt for prompt, _ in ui.calls] == [K05_INTERPRET, WANG_GENERATE, K05_AUDIT]
 
 
 def test_missing_terminal_sse_frame_recovers_committed_reply(ui):

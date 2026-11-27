@@ -11,14 +11,18 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from backend.db import ROOT
 from backend.main import create_app
-from backend.model import LIN_AUDIT, CHEN_AUDIT, CHEN_GENERATE, CHEN_INTERPRET, GENERATE, INTERPRET, K05_ACTIONS, K05_AUDIT, K05_INTERPRET, CompatibleModel
-from backend.policy import Action, FACTS, Reply, k05_parts, validate_reply
+from backend.model import LIN_AUDIT, CHEN_AUDIT, CHEN_GENERATE, CHEN_INTERPRET, GENERATE, INTERPRET, K05_ACTIONS, K05_AUDIT, K05_INTERPRET, WANG_GENERATE, CompatibleModel
+from backend.policy import Action, FACTS, Reply, k05_parts, permission, validate_reply
 
 QUESTION = '这机会你亲自问过招聘方吗？'
 JUDGMENT = '群里转发不能证明招聘方获得了授权。'
 REPLY = '没有，群里看到的。'
 MEMORY_QUESTION = '你还记得当时有没有问过招聘方吗？'
 SOURCE_QUESTION = '你从哪看到的？'
+WANG_STARTER = '你是从哪里看到这条招聘消息的？'
+CHEN_STARTER = '你和招聘企业是什么关系？'
+LIN_STARTER = '这个岗位的正式招聘流程在哪里可以核对？'
+SOURCE_REPLY = '我只在群里看过转发。'
 HELLO = '你好。'
 AUTH_QUESTION = '你能说明这次招聘的委托关系吗？'
 AUTH_REPLY = '我目前无法出示可核实的企业招聘授权。'
@@ -42,7 +46,13 @@ VAGUE_REPLY = '我们一般用邮箱联系。'
 def registration_action(kind, quote, **fields):
     return dict(kind=kind, focus='none', source='own', quote=quote, **fields)
 
+def friend_inquiry(quote, inquiry):
+    return dict(kind='verify_friend', focus='K05', source='own', quote=quote, inquiry=inquiry)
+
 TURNS = {
+    WANG_STARTER: ([friend_inquiry(WANG_STARTER, 'forward_source')], SOURCE_REPLY, [], ('origin',)),
+    LIN_STARTER: ([('verify_official','K04')], LIN_ROUTE, [], ()),
+    CHEN_STARTER: ([('ask_employer','K01')], AUTH_REPLY, [{'focus':'K01','quote':AUTH_REPLY}], ()),
     LIN_ASK: ([('verify_official','K04')], LIN_ROUTE, [{'focus':'K04', 'quote':'公开招聘页面'}], ()),
     CHEN_ASK: ([('verify_official','K04')], CHEN_GAP, [], ()),
     OWN_JUDGMENT: ([('identify_gap','K04'), ('weigh_sources','K04')], '理解，你希望依据独立信息来判断。', [], ()),
@@ -57,9 +67,9 @@ TURNS = {
     ATTEMPT: ([registration_action('respond_registration', ATTEMPT, field='project_experience', status='submitted')], '预登记仍已停止，本次没有收下项目资料。', [], ()),
     PURPOSE: ([('ask_data', 'K02')], '原本说是用来汇总意向和安排面试。', [], ()),
     HELLO: ([], '你好，有什么想了解的？', [], ('other','other')),
-    QUESTION: ([('verify_friend','K05')], REPLY, [], ('self_denies_job_check','origin')),
-    MEMORY_QUESTION: ([('verify_friend','K05')], '我记不清当时问过没有。', [], ('uncertain',)),
-    SOURCE_QUESTION: ([('verify_friend','K05')], '我只在群里看过转发。', [], ('origin',)),
+    QUESTION: ([friend_inquiry(QUESTION, 'personal_check')], REPLY, [], ('self_denies_job_check','origin')),
+    MEMORY_QUESTION: ([friend_inquiry(MEMORY_QUESTION, 'personal_check')], '我记不清当时问过没有。', [], ('uncertain',)),
+    SOURCE_QUESTION: ([friend_inquiry(SOURCE_QUESTION, 'forward_source')], SOURCE_REPLY, [], ('origin',)),
     JUDGMENT: ([('identify_gap','K01'),('weigh_sources','K01')], '明白，你想先找依据。', [], ('other','other')),
     AUTH_QUESTION: ([('ask_employer','K01')], AUTH_REPLY, [{'focus':'K01','quote':AUTH_REPLY}], ()),
 }
@@ -80,10 +90,10 @@ def wire_fixture(api_root='/v1'):
             pairs, reply, disclosures, kinds = TURNS[msg]
             if system in (INTERPRET, K05_INTERPRET, CHEN_INTERPRET):
                 result = {'actions':[p if isinstance(p, dict) else {'kind':p[0],'focus':p[1],'quote':msg,'source':'own'} for p in pairs]}
-            elif system in (GENERATE, CHEN_GENERATE):
+            elif system in (GENERATE, WANG_GENERATE, CHEN_GENERATE):
                 result = {'body':reply}
             elif system in (LIN_AUDIT, K05_AUDIT, CHEN_AUDIT):
-                k04 = {LIN_ASK:'k04_interview_route', CHEN_ASK:'k04_missing_reference'}.get(msg, 'none')
+                k04 = {LIN_STARTER:'k04_interview_route', LIN_ASK:'k04_interview_route', CHEN_ASK:'k04_missing_reference'}.get(msg, 'none')
                 result = {'safe':True,'k04':k04,'supported':list(range(len(data['candidates']))),'disclosures':disclosures,'registration_quote':None}
                 if system == CHEN_AUDIT:
                     stance = {STOP:'stopped', ATTEMPT:'stopped', RESUME:'open', PROJECT_TEXT:'open', CITY_TEXT:'open'}
@@ -113,22 +123,25 @@ def wired_session(tmp_path, monkeypatch):
             yield client, path, headers, calls
 
 @pytest.mark.skipif(os.getenv('SCAMSENSE_TEST_LIVE_K05') != '1', reason='requires an explicitly enabled real model')
-@pytest.mark.parametrize(('question','reply','evidence'), [
-    (QUESTION, '没有，群里看到的。', ('没有',)),
-    (QUESTION, '没有，我只看了群转发，没跟招聘方打过交道。', ('没有', '没跟招聘方打过交道')),
-    ('我在整理校园招聘的信息渠道，你是在校园群、公众号还是学校网站看到这条消息的？',
+@pytest.mark.parametrize(('question','inquiry','previously_disclosed','reply','evidence'), [
+    (QUESTION, 'personal_check', False, '没有，群里看到的。', ('没有',)),
+    (QUESTION, 'personal_check', False, '没有，我只看了群转发，没跟招聘方打过交道。', ('没有', '没跟招聘方打过交道')),
+    ('我在整理校园招聘的信息渠道，你是在校园群、公众号还是学校网站看到这条消息的？', 'forward_source', True,
      '我在校园群看到的，当时觉得挺有意思的，但没去查真伪。', ('没去查真伪',)),
-    ('这条消息是你从学校官网看到的吗？', '没有，群里看到的。', ()),
-    ('你从哪看到的？', '校园群里有人转发过。', ()),
-    ('你从哪看到的？', '我是在群里看到的，没问清楚源头。', ()),
-    (QUESTION, '发给我的同学没亲自核实。', ()),
-    (QUESTION, '我记不清当时问过没有。', ()),
+    ('这条消息是你从学校官网看到的吗？', 'forward_source', False, '没有，群里看到的。', ()),
+    (SOURCE_QUESTION, 'forward_source', False, '校园群里有人转发过。', ()),
+    (SOURCE_QUESTION, 'forward_source', False, '我是在群里看到的，没问清楚源头。', ()),
+    (QUESTION, 'personal_check', False, '发给我的同学没亲自核实。', ()),
+    (QUESTION, 'personal_check', False, '我记不清当时问过没有。', ()),
 ], ids=['elliptical', 'natural', 'mixed', 'elliptical-origin', 'source', 'forward-origin', 'other-person', 'uncertain'])
-def test_live_k05_judgment(question, reply, evidence):
-    action = Action(kind='verify_friend', focus='K05', quote=question, source='own')
-    audit = asyncio.run(CompatibleModel().audit('wang', [], question, FACTS['wang'], False, [action], reply))
+def test_live_k05_judgment(question, inquiry, previously_disclosed, reply, evidence):
+    action = Action(**friend_inquiry(question, inquiry))
+    previous = {'K05'} if previously_disclosed else set()
+    history = [{'speaker':'user','text':QUESTION}, {'speaker':'assistant','text':REPLY}] if previous else []
+    facts, _ = permission('wang', [action], previous, None)
+    audit = asyncio.run(CompatibleModel().audit('wang', history, question, facts, False, [action], reply))
     assert audit.supported == [0] and audit.k05 is not None
-    _, _, disclosed, _ = validate_reply(Reply(body=reply), audit, [action], FACTS['wang'], set(), False, role='wang')
+    _, _, disclosed, _ = validate_reply(Reply(body=reply), audit, [action], facts, previous, False, role='wang')
     assert disclosed == ({'K05':reply} if evidence else {})
     parts = k05_parts(reply)
     denied = [parts[claim.part_id] for claim in audit.k05 if claim.kind == 'self_denies_job_check']
@@ -146,10 +159,11 @@ def test_two_turns_through_compatible_http_contract(wired_session, question, exp
         res = client.post(path+'/turns',headers=headers,json={'role':'wang','text':msg,'request_id':str(uuid4())})
         assert 'event: done' in res.text and res.text.count('event: progress') == 3
     report = client.post(path+'/finish',headers=headers,json={'kind':'decision','choice':'verify','reason':JUDGMENT,'cited':[1,2]}).json()
-    assert [prompt for prompt,_ in calls] == [K05_INTERPRET,GENERATE,K05_AUDIT]*2
+    assert [prompt for prompt,_ in calls] == [K05_INTERPRET,WANG_GENERATE,K05_AUDIT]*2
     reply = ''.join(expected_parts)
     audit = calls[2][1]
-    assert calls[1][1]['permitted_facts'] == audit['permitted_facts'] == {'K05':FACTS['wang']['K05']}
+    expected_facts = {} if question == SOURCE_QUESTION else {'K05':FACTS['wang']['K05']}
+    assert calls[1][1]['permitted_facts'] == audit['permitted_facts'] == expected_facts
     assert audit['current_user'] == question and audit['reply'] == reply
     assert audit['reply_parts'] == [{'part_id':i, 'text':part} for i, part in enumerate(expected_parts)]
     for _, payload in calls[3:]:
@@ -327,7 +341,7 @@ def test_model_receives_only_the_active_role_card(wired_session):
             assert generation['registration']['this_turn'] == []
         else:
             assert all('registration' not in payload for payload in (analysis, generation, audit))
-        prompts = {'wang':[K05_INTERPRET,GENERATE,K05_AUDIT], 'chen':[CHEN_INTERPRET,CHEN_GENERATE,CHEN_AUDIT], 'lin':[INTERPRET,GENERATE,LIN_AUDIT]}[role]
+        prompts = {'wang':[K05_INTERPRET,WANG_GENERATE,K05_AUDIT], 'chen':[CHEN_INTERPRET,CHEN_GENERATE,CHEN_AUDIT], 'lin':[INTERPRET,GENERATE,LIN_AUDIT]}[role]
         assert [prompt for prompt,_ in calls[-3:]] == prompts
         assert analysis == expected_analysis
         assert ('reply_parts' in audit) == (role == 'wang')

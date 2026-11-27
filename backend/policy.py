@@ -18,6 +18,7 @@ class Action(BaseModel):
     focus: Focus
     quote: str = Field(min_length=2, max_length=600)
     source: Literal['own', 'retold', 'uncertain']
+    inquiry: Literal['forward_source', 'personal_check'] | None = None
     opportunity: Literal['lin', 'chen'] | None = None
     field: FieldKey | None = None
     status: Status | None = None
@@ -138,7 +139,7 @@ def validate_actions(analysis, body, role, registered):
             elif body.find(a.quote, pos + 1) != -1:
                 raise RuleRejected(Rule.registration_quote_ambiguous)
             a = a.model_copy(update={'position': pos})
-        key = (a.kind, a.focus, a.field, a.position if a.kind in REGISTRATION_ACTIONS else None)
+        key = (a.kind, a.focus, a.inquiry if a.kind == 'verify_friend' else None, a.field, a.position if a.kind in REGISTRATION_ACTIONS else None)
         evidence = a.status
         if key in seen:
             if seen[key] != evidence:
@@ -195,8 +196,13 @@ def validate_registration_reply(audit, turn, invited_now, submitted):
         raise RuleRejected(Rule.registration_reopen)
 
 
+def requested_facts(actions):
+    # The public forwarding channel needs no access to Wang's firsthand verification history.
+    return {a.focus for a in actions if a.kind in ASKS and (a.kind != 'verify_friend' or a.inquiry == 'personal_check')}
+
+
 def permission(role, actions, previous, turn):
-    wanted = set(previous) | {a.focus for a in actions if a.kind in ASKS}
+    wanted = set(previous) | requested_facts(actions)
     facts = {k:v for k,v in FACTS[role].items() if k in wanted}
     return facts, bool(role == 'chen' and turn and turn.allow_invitation)
 
@@ -211,10 +217,11 @@ def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
     if any(i < 0 or i >= len(actions) for i in audit.supported):
         raise RuleRejected(Rule.evidence_index)
     valid = [a for i,a in enumerate(actions) if i in audit.supported]
-    allowed = {a.focus for a in valid if a.kind in ASKS}
+    allowed = requested_facts(valid)
     unverified = set(facts) - set(previous) - allowed
-    # A rejected K04 question need not discard a harmless reply that didn't use its fact.
-    if unverified - {'K04'}:
+    # For this fact the audit covers the whole reply, so check what it actually revealed below.
+    assessed_fact = 'K05' if role == 'wang' else 'K04'
+    if unverified - {assessed_fact}:
         raise RuleRejected(Rule.unverified_permission)
     parts = k05_parts(body) if role == 'wang' else []
     disclosed = {}
@@ -249,10 +256,16 @@ def validate_reply(reply, audit, actions, facts, previous, invite, *, role):
             raise RuleRejected(Rule.k05_parts)
         kinds = {claim.kind for claim in audit.k05}
         if 'self_denies_job_check' in kinds:
-            if 'K05' not in facts or 'uncertain' in kinds:
-                raise RuleRejected(Rule.k05_disclosure)
+            if 'K05' not in facts or 'K05' in unverified:
+                raise RuleRejected(Rule.k05_not_permitted)
+            if 'uncertain' in kinds:
+                raise RuleRejected(Rule.k05_conflicting_evidence)
             # A later clause can qualify an earlier one, so cite the intact Wang reply.
             disclosed['K05'] = body
+        elif 'K05' in unverified:
+            reported_k05 = any(d.focus == 'K05' for d in audit.disclosures)
+            if kinds != {'origin'} or reported_k05:
+                raise RuleRejected(Rule.unverified_permission)
     reg = audit.registration_quote
     if reg is not None and (not reg.strip() or reg not in body or not invite or not any(a.kind == 'interest' for a in valid)):
         raise RuleRejected(Rule.registration_invite)
